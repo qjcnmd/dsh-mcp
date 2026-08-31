@@ -12,4 +12,5 @@ Thumbs.db
 *.tsbuildinfo
 .idea/
 .vscode/
-
+.agents/
+.specify/
