@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { loadConfig } from '../../src/config.js';
-import { DshDomainError, DshProtocolError, DshRpcErrorBody, DshTransportError } from '../../src/errors.js';
+import { DshDomainError, DshProtocolError, DshTransportError } from '../../src/errors.js';
 import { createMcpServer } from '../../src/mcp/transport.js';
 import { DshEventClient } from '../../src/dsh/event-client.js';
 import { DshRpcClient } from '../../src/dsh/rpc-client.js';
-import { sessionTarget } from '../../src/domain/targets.js';
 import { jsonResponse } from '../unit/fixtures.js';
 
 const config = loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' });
@@ -14,12 +13,6 @@ describe('foundation contracts', () => {
   it('loads bounded loopback defaults', () => {
     expect(config.baseUrl.toString()).toBe('http://127.0.0.1:3080/');
     expect(config.requestTimeoutMs).toBeGreaterThan(0);
-    expect(config.maxItems).toBeGreaterThan(0);
-  });
-
-  it('rejects an implicit or blank session target', () => {
-    expect(() => sessionTarget({})).toThrow(/sessionId/);
-    expect(() => sessionTarget({ sessionId: '  ' })).toThrow(/sessionId/);
   });
 
   it('separates DSH domain rejection from transport and protocol failures', async () => {
@@ -28,15 +21,15 @@ describe('foundation contracts', () => {
       const request = JSON.parse(String(_init?.body)) as { rpcId: string };
       return jsonResponse({ ...body, rpcId: request.rpcId });
     });
-    const result = await client.call('session.list', {});
+    const result = await client.call('session/list', {});
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBeInstanceOf(DshDomainError);
 
     const malformed = new DshRpcClient(config, async () => jsonResponse({ nope: true }));
-    await expect(malformed.call('session.list', {})).rejects.toBeInstanceOf(DshProtocolError);
+    await expect(malformed.call('session/list', {})).rejects.toBeInstanceOf(DshProtocolError);
 
     const transport = new DshRpcClient(config, async () => { throw new Error('offline'); });
-    await expect(transport.call('session.list', {})).rejects.toBeInstanceOf(DshTransportError);
+    await expect(transport.call('session/list', {})).rejects.toBeInstanceOf(DshTransportError);
   });
 
   it('does not read DSH until a caller explicitly subscribes', async () => {

@@ -2,11 +2,9 @@ export type LogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
 
 export interface DshConfig {
   baseUrl: URL;
+  authToken?: string | undefined;
   requestTimeoutMs: number;
   streamConnectTimeoutMs: number;
-  reconnectDelayMs: number;
-  maxTextChars: number;
-  maxItems: number;
   logLevel: LogLevel;
 }
 
@@ -14,9 +12,6 @@ const DEFAULTS = {
   baseUrl: 'http://127.0.0.1:3080/',
   requestTimeoutMs: 30_000,
   streamConnectTimeoutMs: 10_000,
-  reconnectDelayMs: 1_000,
-  maxTextChars: 4_000,
-  maxItems: 100,
   logLevel: 'info' as LogLevel,
 };
 
@@ -37,17 +32,24 @@ function logLevel(value: string | undefined): LogLevel {
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): DshConfig {
   const rawBaseUrl = env.DSH_BASE_URL ?? DEFAULTS.baseUrl;
-  const baseUrl = new URL(rawBaseUrl);
+  const configuredUrl = new URL(rawBaseUrl);
+  const urlToken = configuredUrl.searchParams.get('token')?.trim();
+  const envToken = env.DSH_AUTH_TOKEN?.trim();
+  if (urlToken !== undefined && urlToken !== '' && envToken !== undefined && envToken !== '' && urlToken !== envToken) {
+    throw new Error('DSH_AUTH_TOKEN conflicts with the token in DSH_BASE_URL');
+  }
+  if (configuredUrl.username !== '' || configuredUrl.password !== '') throw new Error('DSH_BASE_URL must not contain user info');
+  const baseUrl = new URL('/', configuredUrl);
+  baseUrl.search = '';
+  baseUrl.hash = '';
   if (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') {
     throw new Error('DSH_BASE_URL must use http or https');
   }
   return {
     baseUrl: new URL(baseUrl.toString().endsWith('/') ? baseUrl.toString() : `${baseUrl.toString()}/`),
+    ...((envToken ?? urlToken) === undefined || (envToken ?? urlToken) === '' ? {} : { authToken: envToken ?? urlToken }),
     requestTimeoutMs: boundedInteger('DSH_REQUEST_TIMEOUT_MS', env.DSH_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs, 100, 300_000),
     streamConnectTimeoutMs: boundedInteger('DSH_STREAM_CONNECT_TIMEOUT_MS', env.DSH_STREAM_CONNECT_TIMEOUT_MS, DEFAULTS.streamConnectTimeoutMs, 100, 120_000),
-    reconnectDelayMs: boundedInteger('DSH_RECONNECT_DELAY_MS', env.DSH_RECONNECT_DELAY_MS, DEFAULTS.reconnectDelayMs, 50, 60_000),
-    maxTextChars: boundedInteger('DSH_MCP_MAX_TEXT_CHARS', env.DSH_MCP_MAX_TEXT_CHARS, DEFAULTS.maxTextChars, 100, 100_000),
-    maxItems: boundedInteger('DSH_MCP_MAX_ITEMS', env.DSH_MCP_MAX_ITEMS, DEFAULTS.maxItems, 1, 10_000),
     logLevel: logLevel(env.DSH_MCP_LOG_LEVEL),
   };
 }

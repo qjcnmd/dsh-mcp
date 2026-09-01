@@ -5,7 +5,7 @@ export interface ProjectionOptions {
 }
 
 const DEFAULTS: Required<ProjectionOptions> = { maxTextChars: 4_000, maxItems: 20, maxDepth: 6 };
-const OMIT_KEYS = new Set(['raw', 'envelope', 'history', 'events', 'trace', 'traces', 'credentials', 'secret', 'token']);
+const OMIT_KEYS = new Set(['raw', 'envelope', 'history', 'events', 'trace', 'traces', 'credentials', 'secret', 'token', 'apikey', 'password', 'authorization', 'cookie', 'privatekey', 'secretkey', 'accesstoken', 'refreshtoken']);
 
 export function truncateText(value: string, maxChars = DEFAULTS.maxTextChars): string {
   if (value.length <= maxChars) return value;
@@ -36,6 +36,7 @@ export function summarize(value: unknown, options: ProjectionOptions = {}): stri
 }
 
 export interface ProjectedToolResult {
+  [key: string]: unknown;
   content: [{ type: 'text'; text: string }];
   structuredContent: Record<string, unknown>;
 }

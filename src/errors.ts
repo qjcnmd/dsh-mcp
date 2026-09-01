@@ -40,20 +40,6 @@ export class DshDomainError extends DshMcpError {
   }
 }
 
-export class UnsupportedCapabilityError extends DshMcpError {
-  constructor(capabilityId: string, message = `Capability ${capabilityId} is not available through the structured DSH contract`) {
-    super('unsupported-capability', message, { capabilityId });
-    this.name = 'UnsupportedCapabilityError';
-  }
-}
-
-export class InvalidTargetError extends DshMcpError {
-  constructor(field: string, message = `${field} is required and must be a non-blank identifier`) {
-    super('invalid-target', message, { field });
-    this.name = 'InvalidTargetError';
-  }
-}
-
 export interface DshRpcErrorBody {
   code: string;
   message: string;

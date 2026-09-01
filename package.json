@@ -1,26 +1,44 @@
 {
-  "name": "dsh-local-mcp",
+  "name": "@qjcnmd/dsh-mcp",
   "version": "0.1.0",
   "private": true,
   "description": "A host-neutral local MCP server for the DSH work surface",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qjcnmd/dsh-mcp.git"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "mcp",
+    "model-context-protocol"
+  ],
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --config vitest.config.ts",
+    "test:live": "npm run build && node tests/integration/live-smoke.mjs",
     "test:watch": "vitest --config vitest.config.ts",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
+    "ws": "8.21.3",
     "zod": "4.5.4"
   },
   "devDependencies": {
     "@types/node": "26.4.0",
+    "@types/ws": "8.18.1",
     "tsx": "4.23.13",
     "typescript": "7.0.2",
     "vitest": "4.1.11"

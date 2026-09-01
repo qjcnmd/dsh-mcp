@@ -1,19 +1,18 @@
-import type { SessionId, WorkspaceId } from './targets.js';
 import type { PendingInteraction } from './pending-interactions.js';
 import type { TurnProjection } from './turns.js';
 
 export type SessionStatus = 'idle' | 'running' | 'waiting_for_input' | 'stopping' | 'error' | 'unknown';
 
 export interface WorkspaceSummary {
-  workspaceId: WorkspaceId;
+  workspaceId: string;
   name: string;
   path?: string;
-  sessionIds: SessionId[];
+  sessionIds: string[];
 }
 
 export interface SessionSummary {
-  sessionId: SessionId;
-  workspaceId: WorkspaceId | null;
+  sessionId: string;
+  workspaceId: string | null;
   title?: string;
   status: SessionStatus;
   running?: boolean;

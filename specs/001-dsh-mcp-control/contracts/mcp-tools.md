@@ -1,142 +1,58 @@
 # MCP Tool Contract
 
-This is the adapter-facing contract for the selected MCP SDK. The complete tool
-registry is generated from the versioned DSH main-work-surface capability inventory;
-the names below define the common shape and the primary lifecycle tools. The final
-inventory may add action-level tools for controls discovered during the implementation
-audit, but it must not silently omit a visible action.
+The public registry contains exactly the following tools. Adding or renaming a tool
+requires an explicit product-scope change and an update to the exact-set contract test.
 
-## Common conventions
+| Tool | Required target/input | Result |
+|---|---|---|
+| `dsh.workspace.list` | none | Workspace baseline and archived session IDs |
+| `dsh.session.archive` | `sessionId` | DSH archive receipt |
+| `dsh.session.list` | optional `cursor` | Bounded session summaries |
+| `dsh.session.create` | exactly one of `workspaceId` or `cwd`; optional `sessionId`, `agentPreset` | Created session identity |
+| `dsh.session.history` | `sessionId`; optional `beforeSeq`, bounded `maxMessages` | Ordered history page and cursor |
+| `dsh.session.models` | `sessionId` | Current DSH catalog and session selection projection |
+| `dsh.session.select_model` | `sessionId`, `provider`, `model`; optional `reasoningEffort` | DSH selection receipt |
+| `dsh.session.send_message` | `sessionId`; exactly one of `message` or `content`; optional `mode`, `clientTimeZone` | Immediate admission and `turnRef` |
+| `dsh.session.wait_turn` | `turnRef`; optional bounded `timeoutMs` | Matching turn state, reason, final answer, pending interaction |
+| `dsh.session.cancel` | `sessionId` | DSH cancellation receipt |
+| `dsh.session.respond_approval` | `sessionId`, `pendingInteractionId`, `outcome` | DSH interaction receipt |
+| `dsh.session.answer_question` | `sessionId`, `pendingInteractionId`, `answers` | DSH interaction receipt |
+| `dsh.session.command` | `sessionId`, slash-prefixed `command` | DSH command execution |
+| `dsh.command.compact` | `sessionId`; optional `instructions` | DSH `/compact` execution |
+| `dsh.session.snapshot` | `sessionId`; optional bounded `recentEvents` | Bounded current session projection |
+| `dsh.session.context_stats` | `sessionId` | Available context/token/usage projections |
+| `dsh.agent_preset.select` | `sessionId`, `agentPreset` | DSH preset receipt |
+| `dsh.page.select_session` | `sessionId` | Selected MCP read context |
+| `dsh.page.get_context` | none | Selected read context and current summaries |
 
-- Tool names are stable MCP names using lowercase segments separated by dots, for
-  example dsh.session.send_message. Names obey MCP tool-name character and length
-  constraints.
-- Every mutating input contains an explicit workspaceId, sessionId, turnRef, or
-  pendingInteractionId target as required by the action. No mutation defaults to the
-  page's current selection.
-- Every result contains structured JSON matching its declared output schema and a
-  short human-readable content summary. Modern MCP results may additionally carry
-  resultType: complete or resultType: input_required.
-- A valid DSH rejection or execution failure is a tool result with isError: true and
-  a bounded domain error. Invalid MCP arguments, unknown tools, and protocol failures
-  use the SDK's JSON-RPC error path.
-- Results report DSH's observed effect: applied, queued, changed, superseded,
-  rejected, or unknown.
-- Raw DSH envelopes, secrets, full history, and unbounded event traces are not part
-  of normal results.
+## Common result rules
 
-## Lifecycle tools
+- Results include structured content plus a concise text rendering.
+- Mutations identify their explicit target and report `accepted` and `effect`.
+- DSH domain rejection returns a bounded error with the native DSH code.
+- Transport and malformed-protocol failures remain adapter errors.
+- Raw RPC envelopes, cookies, launch tokens, full traces, and unbounded history are
+  never returned.
 
-### dsh.session.send_message
+## Turn contract
 
-Input (logical shape):
+`dsh.session.send_message` creates a local opaque `turnRef` before calling
+`session/prompt`. The request carries its own `requestId`. DSH history later associates
+that request identity with a numeric turn through `user/message.data.source.rpcId`.
 
-~~~json
-{
-  "sessionId": "string",
-  "message": "string",
-  "mode": "send | queue | steer",
-  "attachments": ["string"]
-}
-~~~
+`dsh.session.wait_turn` listens to `session/follow` and the DSH remote interaction
+stream. It returns one of:
 
-mode and attachments are registered only when the capability inventory confirms that
-the current DSH surface supports them. The logical `send` mode uses the verified DSH
-default prompt path; `queue` and `steer` are passed only when their DSH semantics are
-confirmed. The tool returns immediately:
+- `terminal` for a proven completed, failed, cancelled, or interrupted turn;
+- `pending-human-input` for a matching approval or question;
+- `timed-out` when the MCP call deadline expires while the turn remains nonterminal;
+- `transport-lost` when neither events nor a bounded recovery snapshot can prove an
+  outcome.
 
-~~~json
-{
-  "target": {"sessionId": "string"},
-  "accepted": true,
-  "effect": "applied | queued | changed | rejected | unknown",
-  "turnRef": "opaque-string",
-  "state": "accepted | queued | running | unknown",
-  "reason": "string | null"
-}
-~~~
+MCP request cancellation releases observation resources and does not invoke
+`dsh.session.cancel`.
 
-### dsh.session.wait_turn
+## Context contract
 
-Input:
-
-~~~json
-{
-  "turnRef": "opaque-string",
-  "timeoutMs": "integer | null"
-}
-~~~
-
-The adapter subscribes to DSH events internally and waits for only this turn. It
-does not periodically query DSH status. timeoutMs bounds the MCP call; reaching it
-returns an explicit nonterminal result rather than a fabricated terminal state. The
-normal result is a complete result:
-
-~~~json
-{
-  "turnRef": "opaque-string",
-  "sessionId": "string",
-  "state": "completed | failed | cancelled | interrupted | pending-human-input | transport-lost | unknown",
-  "waitOutcome": "terminal | pending-human-input | timed-out | transport-lost",
-  "reason": "string | null",
-  "finalAnswer": "string | null",
-  "pendingInteraction": "object | null",
-  "evidence": "event | history | recovered | incomplete"
-}
-~~~
-
-When the host negotiated modern input-required tool results, a pending DSH question or
-approval may instead be returned as:
-
-~~~json
-{
-  "resultType": "input_required",
-  "inputRequests": {"pendingInteractionId": {"method": "elicitation/create"}},
-  "requestState": "opaque-string",
-  "structuredContent": {"turnRef": "opaque-string", "state": "pending-human-input"}
-}
-~~~
-
-The adapter still exposes dedicated answer/approval tools so a host can submit the
-response directly to the DSH target and so legacy hosts do not need to implement the
-modern multi-round retry shape. A pending interaction is never treated as a completed
-turn.
-
-## Inspection tools
-
-The inventory must expose action-level tools for the main surface's supported read
-operations, including the equivalent of:
-
-- dsh.workspace.list and workspace selection/inspection actions.
-- dsh.session.list, dsh.session.search, dsh.session.history, and session
-  selection/creation/rename/fork/archive actions.
-- Effective model and reasoning inspection and selection actions.
-- dsh.session.snapshot for a bounded live projection.
-- Bounded history, selected-event, and diagnostics actions when the surface exposes
-  the corresponding inspection.
-
-These operations return explicit target identity, ordering metadata, bounded data, and
-the DSH version/capability source used for the response.
-
-## Intervention tools
-
-When the inventory confirms the corresponding DSH controls, expose separate action
-tools for:
-
-- queue update and steering;
-- stop/cancel;
-- question answer;
-- approval/confirmation response;
-- any other visible running-session intervention.
-
-Each tool targets the exact session, turn, or pending interaction and returns DSH's
-native acceptance/rejection and resulting state. A request cancellation sent by an MCP
-host cancels observation of a tool call; it does not implicitly invoke a DSH stop/cancel
-action.
-
-## Dynamic registry behavior
-
-The inventory may change when the supported DSH version or visible capability set
-changes. If the SDK supports notifications/tools/list_changed, the server may send
-that notification; correctness must still come from the next tools/list and the
-individual tool call, not from delivery of the notification.
+The two `dsh.page.*` tools model a convenient read context held by the MCP server.
+They do not mutate a browser tab or supply implicit targets to mutating tools.

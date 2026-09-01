@@ -1,86 +1,44 @@
 # Lifecycle and Event Contract
 
-## Source boundaries
+## Send and correlate
 
-1. MCP transport carries JSON-RPC requests, responses, and optional notifications
-   between a host and the adapter.
-2. DSH HTTP RPC performs commands and bounded reads.
-3. DSH server-sent event streams provide the normal observation path for running state and
-   turn completion.
+1. `dsh.session.send_message` creates a unique prompt `requestId` and local `turnRef`.
+2. It calls DSH `session/prompt` and returns after admission.
+3. `dsh.session.wait_turn` opens `session/follow` for that session.
+4. A `turn/start` records the current DSH turn number.
+5. The following `user/message` binds the local request only when
+   `data.source.rpcId` equals the prompt `requestId`.
+6. Assistant messages and `turn/end` are accepted only for that bound DSH turn.
 
-The adapter never treats MCP progress, Tasks, or a host notification as proof that a
-DSH turn completed. DSH events and recoverable DSH history are the evidence source.
+This prevents old snapshot records or another concurrent turn from completing the
+requested wait.
 
-## Send-to-wait sequence
+## Terminal projection
 
-~~~text
-host -> dsh.session.send_message(sessionId, message)
-adapter -> DSH session.prompt RPC
-DSH -> adapter: accepted response with source turn identity
-adapter -> host: turnRef + accepted/queued state
+| DSH end reason | MCP turn state |
+|---|---|
+| `completed` | `completed` |
+| user-caused `aborted` | `cancelled` |
+| other `aborted` or `interrupted` | `interrupted` |
+| `error`, `blocked`, `max-tokens` | `failed` |
 
-host -> dsh.session.wait_turn(turnRef)
-adapter -> DSH event subscription (already shared when possible)
-DSH -> adapter: ordered session events
-adapter -> host: one bounded terminal or pending-human-input result
-~~~
+The last matching assistant text is retained as `finalAnswer`. Unknown evidence is
+reported as unknown rather than inferred from session idleness.
 
-The shared event subscription is an implementation detail. Each wait operation filters
-by its explicit turnRef and must not return because another turn or another session
-became idle.
+## Human input
 
-If a negotiated host cannot keep a normal tool call open long enough, the adapter may
-return an MCP task handle for the same wait operation. The task worker consumes this
-projection and stores the terminal result; a client's tasks/get query observes the
-adapter task state and never triggers periodic DSH status polling.
+While a wait is active, the DSH `$events` stream supplies approval and question
+requests. The wait returns `pending-human-input` with the event identity. A later
+approval or answer tool submits `$events/result` for that exact DSH client and event.
+Question results include the stable question IDs, text, options, selection mode, and
+known presentation intent needed to construct the answer.
 
-## State interpretation
+## Cancellation and recovery
 
-The adapter records only transitions supported by observed DSH evidence:
+Cancelling the MCP request aborts the event streams and timers for that wait. It does
+not call DSH cancellation.
 
-- acceptance response -> accepted;
-- queue/steering acknowledgement -> queued or changed;
-- execution-start/progress evidence -> running;
-- question/approval request -> pending-human-input;
-- DSH turn/end or equivalent terminal event -> completed, failed, cancelled, or
-  interrupted according to the event reason;
-- event disconnect with an unclosed turn -> reconnect/recovery path;
-- unrecoverable gap or ambiguous history -> transport-lost or unknown.
-
-No transition is inferred from elapsed time, a missing event, or a session-wide idle
-signal.
-
-## Cancellation separation
-
-- MCP request cancellation ends the adapter's wait/observation and releases any
-  per-call subscription.
-- dsh.session.cancel or dsh.session.stop is an explicit DSH mutation and may change
-  the running turn only after DSH accepts it.
-- If the host supports MCP cancellation notifications or transport stream closure,
-  the selected official SDK owns their wire handling. The domain layer receives a
-  local cancellation signal only.
-
-## Reconnect and recovery
-
-1. Mark the observation channel disconnected without assigning a terminal turn state.
-2. Reconnect to the DSH event endpoint using the adapter's last confirmed cursor or
-   equivalent position when DSH supports it.
-3. Reconcile missed events with DSH history and current session reads.
-4. If a matching terminal event/history record is found, return the corresponding
-   terminal state with evidence: recovered.
-5. If the evidence cannot distinguish success, failure, cancellation, or interruption,
-   return transport-lost/unknown and state that the result is unproven.
-
-Recovery must be idempotent: duplicate events or repeated history reads must not
-produce multiple terminal results for the same turnRef.
-
-## Pending human input
-
-Question and approval events are projected as PendingInteraction records. When the
-modern MCP result shape is negotiated, wait_turn may return resultType: input_required
-with inputRequests and requestState; otherwise it returns the same pending interaction
-inside the bounded structured result and ends its current call. Dedicated
-answer/approval tools submit the response to the same DSH target; the next wait_turn
-call observes whether the turn resumed or ended. The adapter does not assume that a
-host will surface elicitation or multi-round retries correctly, so the direct action
-tools remain part of the common contract.
+If `session/follow` fails, the wait reads one bounded current snapshot and searches for
+the matching prompt request and DSH turn. A proven terminal event is returned as
+recovered evidence; otherwise the result is `transport-lost` with incomplete evidence.
+No periodic status loop is used.
