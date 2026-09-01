@@ -13,8 +13,8 @@ export function registerCommandActions(server: McpServer, runtime: ActionRuntime
 
   registerAction(server, 'dsh.command.compact', {
     description: 'Compact one explicitly targeted DSH session.',
-    inputSchema: z.object({ sessionId, instructions: z.string().trim().min(1).optional() }),
-  }, (args, ctx) => executeCommand(runtime, args.sessionId, `/compact${args.instructions === undefined ? '' : ` ${args.instructions}`}`, requestSignal(ctx)));
+    inputSchema: z.object({ sessionId }),
+  }, (args, ctx) => executeCommand(runtime, args.sessionId, '/compact', requestSignal(ctx)));
 }
 
 async function executeCommand(runtime: ActionRuntime, sessionId: string, line: string, signal: AbortSignal) {

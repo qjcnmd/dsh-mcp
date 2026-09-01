@@ -18,7 +18,7 @@ requires an explicit product-scope change and an update to the exact-set contrac
 | `dsh.session.respond_approval` | `sessionId`, `pendingInteractionId`, `outcome` | DSH interaction receipt |
 | `dsh.session.answer_question` | `sessionId`, `pendingInteractionId`, `answers` | DSH interaction receipt |
 | `dsh.session.command` | `sessionId`, slash-prefixed `command` | DSH command execution |
-| `dsh.command.compact` | `sessionId`; optional `instructions` | DSH `/compact` execution |
+| `dsh.command.compact` | `sessionId` | DSH `/compact` execution |
 | `dsh.session.snapshot` | `sessionId`; optional bounded `recentEvents` | Bounded current session projection |
 | `dsh.session.context_stats` | `sessionId` | Available context/token/usage projections |
 | `dsh.agent_preset.select` | `sessionId`, `agentPreset` | DSH preset receipt |

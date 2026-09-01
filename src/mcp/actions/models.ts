@@ -20,7 +20,10 @@ export function registerModelActions(server: McpServer, runtime: ActionRuntime):
     const session = sessions.value.items.find((item) => item.sessionId === args.sessionId);
     if (session === undefined) return projectToolResult({ target: { sessionId: args.sessionId }, accepted: false, effect: 'rejected', error: { code: 'session-not-found', message: 'The requested session is not visible.' } });
     const selection = readModelSelection(session);
-    return projectToolResult({ target: { sessionId: args.sessionId }, accepted: true, effect: 'applied', result: { catalog: catalog.value, selection } });
+    return projectToolResult(
+      { target: { sessionId: args.sessionId }, accepted: true, effect: 'applied', result: { catalog: catalog.value, selection } },
+      { maxDepth: 10 },
+    );
   });
 
   registerAction(server, 'dsh.session.select_model', {
