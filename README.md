@@ -23,8 +23,27 @@ The server is intentionally small. It exposes exactly these 19 tools:
 - Mutating tools always require an explicit DSH target.
 - `dsh.session.wait_turn` waits on DSH events; it does not periodically query status.
 - DSH connections are opened only for an explicit tool call or an active turn wait.
-- Results are bounded and omit credentials, raw envelopes, and unrequested traces.
+- List and history results are paged. Final responses are returned once, without
+  truncation, and results omit credentials, raw envelopes, and unrequested traces.
 - The context tools keep a read context inside the MCP process. They do not control a browser page.
+- `turnRef` values belong to the running MCP process. Send and wait for a turn through
+  the same process.
+
+## Core flow
+
+1. Find a target with `dsh.workspace.list` or `dsh.session.list`. Both return
+   `hasMore` and an opaque `nextCursor` when another page exists.
+2. Use `dsh.session.send_message`. The default mode is `steer`; pass `queue` to wait
+   behind an active turn.
+3. Pass the returned `turnRef` to `dsh.session.wait_turn`. It resolves on completion,
+   failure, cancellation, interruption, required input, timeout, or transport loss.
+4. If input is required, answer the exact interaction ID and wait on the same
+   `turnRef` again.
+
+`dsh.session.history` is an explicit compact read: it defaults to one recent turn,
+accepts at most five per page, and excludes reasoning, chunks, tool calls, and tool
+results. Tool execution failures use `isError: true` with a stable error code, message,
+and target.
 
 ## Install and run
 

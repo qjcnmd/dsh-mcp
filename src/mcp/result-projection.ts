@@ -1,39 +1,8 @@
-export interface ProjectionOptions {
-  maxTextChars?: number;
-  maxItems?: number;
-  maxDepth?: number;
-}
-
-const DEFAULTS: Required<ProjectionOptions> = { maxTextChars: 4_000, maxItems: 20, maxDepth: 6 };
-const OMIT_KEYS = new Set(['raw', 'envelope', 'history', 'events', 'trace', 'traces', 'credentials', 'secret', 'token', 'apikey', 'password', 'authorization', 'cookie', 'privatekey', 'secretkey', 'accesstoken', 'refreshtoken']);
-
-export function truncateText(value: string, maxChars = DEFAULTS.maxTextChars): string {
-  if (value.length <= maxChars) return value;
-  return `${value.slice(0, Math.max(0, maxChars - 1))}…`;
-}
-
-export function projectBounded(value: unknown, options: ProjectionOptions = {}, depth = 0): unknown {
-  const config = { ...DEFAULTS, ...options };
-  if (typeof value === 'string') return truncateText(value, config.maxTextChars);
-  if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
-  if (depth >= config.maxDepth) return '[depth-limited]';
-  if (Array.isArray(value)) return value.slice(0, config.maxItems).map((item) => projectBounded(item, config, depth + 1));
-  if (typeof value === 'object') {
-    const output: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (OMIT_KEYS.has(key.toLowerCase())) continue;
-      output[key] = projectBounded(item, config, depth + 1);
-    }
-    return output;
-  }
-  return String(value);
-}
-
-export function summarize(value: unknown, options: ProjectionOptions = {}): string {
-  const projected = projectBounded(value, options);
-  const text = typeof projected === 'string' ? projected : JSON.stringify(projected);
-  return truncateText(text ?? 'null', options.maxTextChars ?? DEFAULTS.maxTextChars);
-}
+const OMIT_KEYS = new Set([
+  'raw', 'envelope', 'history', 'events', 'trace', 'traces', 'credentials',
+  'secret', 'token', 'apikey', 'password', 'authorization', 'cookie',
+  'privatekey', 'secretkey', 'accesstoken', 'refreshtoken',
+]);
 
 export interface ProjectedToolResult {
   [key: string]: unknown;
@@ -41,8 +10,35 @@ export interface ProjectedToolResult {
   structuredContent: Record<string, unknown>;
 }
 
-export function projectToolResult(value: Record<string, unknown>, options: ProjectionOptions = {}): ProjectedToolResult {
-  const projected = projectBounded(value, options);
-  const structuredContent = (typeof projected === 'object' && projected !== null && !Array.isArray(projected)) ? projected as Record<string, unknown> : { value: projected };
-  return { content: [{ type: 'text', text: summarize(structuredContent, options) }], structuredContent };
+export function projectToolResult(
+  value: object,
+  summary = defaultSummary(value),
+): ProjectedToolResult {
+  return {
+    content: [{ type: 'text', text: summary }],
+    structuredContent: redactCredentialFields(value) as Record<string, unknown>,
+  };
+}
+
+function redactCredentialFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactCredentialFields);
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !OMIT_KEYS.has(key.toLowerCase()))
+      .map(([key, item]) => [key, redactCredentialFields(item)]),
+  );
+}
+
+function defaultSummary(value: object): string {
+  const record = value as Record<string, unknown>;
+  if (isRecord(record.error) && typeof record.error.message === 'string') return record.error.message;
+  if (typeof record.state === 'string') return `DSH turn state: ${record.state}.`;
+  if (Array.isArray(record.items)) return `Returned ${record.items.length} items.`;
+  if (typeof record.accepted === 'boolean') return record.accepted ? 'DSH operation accepted.' : 'DSH operation rejected.';
+  return 'DSH operation completed.';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

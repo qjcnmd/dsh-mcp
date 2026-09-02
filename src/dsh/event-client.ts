@@ -28,8 +28,17 @@ export interface SessionFollowSnapshot {
 }
 
 export interface WorkspaceBaseline {
-  items: Array<Record<string, unknown>>;
+  items: DshWorkspaceView[];
   archivedSessionIds: string[];
+}
+
+export interface DshWorkspaceView {
+  workspaceId: string;
+  path: string;
+  title: string;
+  sessionIds: string[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 type RemoteFrame =
@@ -107,7 +116,7 @@ export class DshEventClient {
       throw new DshProtocolError('DSH returned an invalid workspace baseline');
     }
     return {
-      items: frame.value.items.filter(isRecord),
+      items: frame.value.items.filter(isWorkspaceView),
       archivedSessionIds: frame.value.archivedSessionIds.filter((value): value is string => typeof value === 'string'),
     };
   }
@@ -365,4 +374,8 @@ export class DshEventClient {
       else if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
     }
   }
+}
+
+function isWorkspaceView(value: unknown): value is DshWorkspaceView {
+  return isRecord(value) && typeof value.workspaceId === 'string' && typeof value.path === 'string' && typeof value.title === 'string' && Array.isArray(value.sessionIds) && value.sessionIds.every((id) => typeof id === 'string') && typeof value.createdAt === 'string' && typeof value.updatedAt === 'string';
 }

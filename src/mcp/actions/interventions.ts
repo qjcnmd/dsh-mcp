@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
 import type { ActionRuntime } from './common.js';
-import { mutateResult, projectToolResult, registerAction, requestSignal } from './common.js';
+import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
 
 const sessionId = z.string().trim().min(1);
 const pendingInteractionId = z.string().trim().min(1);
@@ -10,11 +10,17 @@ export function registerInterventionActions(server: McpServer, runtime: ActionRu
   registerAction(server, 'dsh.session.cancel', {
     description: 'Cancel the active turn for one explicitly targeted session while preserving queued work.',
     inputSchema: z.object({ sessionId }),
-  }, (args, ctx) => mutateResult(runtime.rpc.session.cancel(args, requestSignal(ctx)), { sessionId: args.sessionId }));
+    outputSchema: z.object({ sessionId, cancellationRequested: z.literal(true) }),
+  }, async (args, ctx) => {
+    const result = await runtime.rpc.session.cancel(args, requestSignal(ctx));
+    if (!result.ok) return toolExecutionError(result.error.dshCode, result.error.message, { sessionId: args.sessionId });
+    return projectToolResult({ sessionId: args.sessionId, cancellationRequested: true }, `Cancellation requested for ${args.sessionId}.`);
+  });
 
   registerAction(server, 'dsh.session.respond_approval', {
     description: 'Resolve one pending DSH approval with a one-shot grant or rejection.',
     inputSchema: z.object({ sessionId, pendingInteractionId, outcome: z.enum(['allowed-once', 'rejected']) }),
+    outputSchema: z.object({ sessionId, pendingInteractionId, outcome: z.enum(['allowed-once', 'rejected']), accepted: z.literal(true) }),
   }, (args, ctx) => respond(runtime, args.sessionId, args.pendingInteractionId, 'approval', args.outcome, requestSignal(ctx)));
 
   registerAction(server, 'dsh.session.answer_question', {
@@ -24,22 +30,25 @@ export function registerInterventionActions(server: McpServer, runtime: ActionRu
       pendingInteractionId,
       answers: z.array(z.object({ id: z.string().min(1), selected: z.array(z.string()), custom: z.string().optional() })).min(1),
     }),
+    outputSchema: z.object({ sessionId, pendingInteractionId, accepted: z.literal(true) }),
   }, (args, ctx) => respond(runtime, args.sessionId, args.pendingInteractionId, 'question', { answers: args.answers }, requestSignal(ctx)));
 }
 
 async function respond(runtime: ActionRuntime, sessionId: string, interactionId: string, kind: 'approval' | 'question', value: unknown, signal: AbortSignal) {
   const pending = runtime.pending.get(interactionId);
   if (pending === undefined) {
-    return { ...projectToolResult({ target: { sessionId, pendingInteractionId: interactionId }, accepted: false, effect: 'rejected', error: { code: 'pending-interaction-not-found', message: 'The pending interaction is no longer available.' } }), isError: true };
+    return toolExecutionError('pending-interaction-not-found', 'The pending interaction is no longer available.', { sessionId, pendingInteractionId: interactionId });
   }
   if (pending.sessionId !== sessionId || pending.kind !== kind) {
-    return { ...projectToolResult({ target: { sessionId, pendingInteractionId: interactionId }, accepted: false, effect: 'rejected', error: { code: 'pending-interaction-mismatch', message: 'The pending interaction does not match the requested session or response type.' } }), isError: true };
+    return toolExecutionError('pending-interaction-mismatch', 'The pending interaction does not match the requested session or response type.', { sessionId, pendingInteractionId: interactionId });
   }
   const receipt = await runtime.events.respondRemoteInteraction(interactionId, value, signal);
   if (!receipt.ok) {
-    return projectToolResult({ target: { sessionId, pendingInteractionId: interactionId }, accepted: false, effect: 'rejected', error: { code: receipt.error.dshCode, message: receipt.error.message } });
+    return toolExecutionError(receipt.error.dshCode, receipt.error.message, { sessionId, pendingInteractionId: interactionId });
   }
   runtime.turns.resolveInteraction(interactionId);
   runtime.pending.remove(interactionId);
-  return projectToolResult({ target: { sessionId, pendingInteractionId: interactionId }, accepted: true, effect: 'applied', result: { accepted: true } });
+  return kind === 'approval'
+    ? projectToolResult({ sessionId, pendingInteractionId: interactionId, outcome: value as 'allowed-once' | 'rejected', accepted: true }, 'Approval response accepted.')
+    : projectToolResult({ sessionId, pendingInteractionId: interactionId, accepted: true }, 'Question answer accepted.');
 }

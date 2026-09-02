@@ -6,11 +6,17 @@ export type TurnState = (typeof TURN_STATES)[number];
 export type TerminalTurnState = Extract<TurnState, 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'transport-lost' | 'unknown'>;
 export type TurnEvidence = 'event' | 'history' | 'rpc' | 'recovered' | 'incomplete';
 
+export interface TerminalReason {
+  kind: string;
+  code: string | null;
+  message: string | null;
+}
+
 export interface TurnProjection {
   turnRef: string;
   sessionId: string;
   state: TurnState;
-  reason: string | null;
+  reason: TerminalReason | null;
   finalAnswer: string | null;
   pendingInteractionId: string | null;
   observedAt: string;
@@ -76,14 +82,13 @@ export class TurnStore {
     return this.bindSource(record.turnRef, `dsh-turn:${turn}`);
   }
 
-  findByDshTurn(sessionId: string, turn: number): TurnRecord | undefined {
+  findByDshTurn(sessionId: string, turn: number): TurnRecord[] {
     const sourceRef = `dsh-turn:${turn}`;
-    const record = [...this.records.values()].find((candidate) => candidate.sessionId === sessionId && candidate.sourceRef === sourceRef);
-    return record === undefined ? undefined : { ...record };
+    return [...this.records.values()].filter((candidate) => candidate.sessionId === sessionId && candidate.sourceRef === sourceRef).map((record) => ({ ...record }));
   }
 
   reject(turnRef: string, reason: string): TurnRecord {
-    return this.transition(turnRef, { state: 'failed', reason, finalAnswer: null, pendingInteractionId: null, evidence: 'rpc' });
+    return this.transition(turnRef, { state: 'failed', reason: { kind: 'rejected', code: null, message: reason }, finalAnswer: null, pendingInteractionId: null, evidence: 'rpc' });
   }
 
   resolveInteraction(pendingInteractionId: string): TurnRecord | undefined {

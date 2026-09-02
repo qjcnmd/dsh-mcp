@@ -19,7 +19,7 @@ describe('DSH Remote stream client', () => {
         if (message.type !== 'open' || typeof message.streamId !== 'string') return;
         opens.push(message);
         if (message.endpoint === 'workspace/follow') {
-          socket.send(JSON.stringify({ type: 'item', streamId: message.streamId, value: { type: 'baseline', value: { items: [{ workspaceId: 'workspace-test', sessionIds: ['session-test'] }], archivedSessionIds: [] } } }));
+          socket.send(JSON.stringify({ type: 'item', streamId: message.streamId, value: { type: 'baseline', value: { items: [{ workspaceId: 'workspace-test', title: 'Test', path: 'C:\\test', sessionIds: ['session-test', 'archived-test'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' }], archivedSessionIds: ['archived-test'] } } }));
           return;
         }
         if (message.endpoint === 'session/follow') {
@@ -29,6 +29,7 @@ describe('DSH Remote stream client', () => {
         if (message.endpoint === '$events') {
           socket.send(JSON.stringify({ type: 'item', streamId: message.streamId, value: { type: 'ready', clientId: 'client-test', host: { home: '/home/test' } } }));
           socket.send(JSON.stringify({ type: 'item', streamId: message.streamId, value: { type: 'waterfall', event: 'user-questions/request', eventId: 'question-test', agentId: 'session-test', request: { questions: [{ id: 'choice', question: 'Continue?', options: [{ label: 'yes' }] }] } } }));
+          socket.send(JSON.stringify({ type: 'item', streamId: message.streamId, value: { type: 'waterfall', event: 'approval/request', eventId: 'approval-test', agentId: 'session-test', request: { toolName: 'shell', reason: 'write file' } } }));
         }
       });
     });
@@ -43,14 +44,18 @@ describe('DSH Remote stream client', () => {
 
     const workspace = await client.workspaceSnapshot();
     expect(workspace.items[0]?.workspaceId).toBe('workspace-test');
+    expect(workspace.archivedSessionIds).toEqual(['archived-test']);
 
     const events: string[] = [];
     const unsubscribe = client.subscribeSession('session-test', (event) => events.push(event.method));
-    await waitFor(() => events.includes('user-questions/request'));
+    await waitFor(() => events.includes('user-questions/request') && events.includes('approval/request'));
     const response = await client.respondRemoteInteraction('question-test', { answers: [{ id: 'choice', selected: ['yes'] }] });
+    const approval = await client.respondRemoteInteraction('approval-test', 'allowed-once');
     expect(response.ok).toBe(true);
-    expect(rpcBodies).toHaveLength(1);
+    expect(approval.ok).toBe(true);
+    expect(rpcBodies).toHaveLength(2);
     expect(rpcBodies[0]).toMatchObject({ method: '$events/result', payload: { args: { clientId: 'client-test', eventId: 'question-test', outcome: { kind: 'result' } } } });
+    expect(rpcBodies[1]).toMatchObject({ method: '$events/result', payload: { args: { clientId: 'client-test', eventId: 'approval-test', outcome: { kind: 'result', value: 'allowed-once' } } } });
     expect(opens.map((open) => open.endpoint)).toEqual(expect.arrayContaining(['workspace/follow', 'session/follow', '$events']));
 
     unsubscribe();

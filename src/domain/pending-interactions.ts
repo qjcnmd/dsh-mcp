@@ -26,6 +26,11 @@ export interface PendingInteraction {
   expiresAt: string | null;
 }
 
+export function publicPendingInteraction(value: PendingInteraction): Record<string, unknown> {
+  if (value.kind === 'approval') return { kind: 'approval', pendingInteractionId: value.pendingInteractionId, sessionId: value.sessionId, prompt: value.prompt, options: value.options.map((option) => ({ outcome: option.label, label: option.label })) };
+  return { kind: 'question', pendingInteractionId: value.pendingInteractionId, sessionId: value.sessionId, questions: value.questions ?? [] };
+}
+
 export class PendingInteractionStore {
   private readonly records = new Map<string, PendingInteraction>();
 

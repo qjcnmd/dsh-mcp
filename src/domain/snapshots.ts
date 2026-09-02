@@ -1,34 +1,10 @@
-import type { PendingInteraction } from './pending-interactions.js';
-import type { TurnProjection } from './turns.js';
-
-export type SessionStatus = 'idle' | 'running' | 'waiting_for_input' | 'stopping' | 'error' | 'unknown';
-
-export interface WorkspaceSummary {
-  workspaceId: string;
-  name: string;
-  path?: string;
-  sessionIds: string[];
-}
-
-export interface SessionSummary {
-  sessionId: string;
-  workspaceId: string | null;
-  title?: string;
-  status: SessionStatus;
-  running?: boolean;
-}
-
-export interface EventCursor {
-  stream: string;
-  position: string | null;
-  lastEventType: string | null;
-  updatedAt: string;
-}
+import type { SessionSummary } from './collections.js';
+import type { TerminalReason, TurnState } from './turns.js';
 
 export interface RuntimeSnapshot {
   session: SessionSummary;
-  activeTurn: TurnProjection | null;
-  pendingInteractions: PendingInteraction[];
-  recentEvents?: Array<{ type: string; sessionId?: string; observedAt: string }>;
-  cursor: EventCursor | null;
+  activeTurn: { turnRef: string; state: TurnState; reason: TerminalReason | null; observedAt: string } | null;
+  pendingInteractions: Array<Record<string, unknown>>;
+  recentEvents: Array<{ seq: number; type: string; time: number | null; turn: number | null }>;
+  cursor: number;
 }

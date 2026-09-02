@@ -6,7 +6,17 @@ export interface RpcSuccess<T> { ok: true; value: T; }
 export interface RpcFailure { ok: false; error: DshDomainError; }
 export type RpcResult<T> = RpcSuccess<T> | RpcFailure;
 
-export interface SessionListValue { items: Array<Record<string, unknown>>; }
+export interface DshSessionSummary {
+  sessionId: string;
+  updatedAt: number;
+  running: boolean;
+  blank: boolean;
+  parentSessionId?: string;
+  origin?: 'subagent';
+  cwd?: string;
+  projections?: { asOfSeq: number; values: Record<string, unknown> };
+}
+export interface SessionListValue { items: DshSessionSummary[]; }
 export interface SessionCreateValue { sessionId: string; agentPreset?: string; }
 export interface SessionHistoryRecord { type: 'event' | 'chunks'; event: Record<string, unknown>; }
 export interface SessionPageValue { records: SessionHistoryRecord[]; hasMore: boolean; }

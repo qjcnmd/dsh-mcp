@@ -1,111 +1,116 @@
 import { z } from 'zod';
-import type { CallToolResult, McpServer, ServerContext } from '@modelcontextprotocol/server';
+import type { CallToolResult, McpServer } from '@modelcontextprotocol/server';
 import type { DshEvent } from '../../dsh/event-client.js';
 import type { SessionPromptPart } from '../../dsh/rpc-client.js';
-import type { PendingQuestion } from '../../domain/pending-interactions.js';
-import { classifyHistoryTurn } from '../../dsh/recovery.js';
-import { isTerminalState, type TurnRecord, type TurnState } from '../../domain/turns.js';
+import { publicPendingInteraction, type PendingQuestion } from '../../domain/pending-interactions.js';
+import { classifyHistoryTurn, terminalFromReason, visibleAssistantText } from '../../dsh/recovery.js';
+import { isTerminalState, type TerminalReason, type TurnRecord } from '../../domain/turns.js';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal } from './common.js';
+import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
 
-const sessionId = z.string().trim().min(1);
-const turnRef = z.string().trim().min(1);
-
+const id = z.string().trim().min(1);
+const reasonSchema = z.object({ kind: z.string(), code: z.string().nullable(), message: z.string().nullable() });
 const contentPart = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string().min(1) }),
-  z.object({ type: z.literal('image'), mediaType: z.enum(['image/png', 'image/jpeg', 'image/webp', 'image/gif']), data: z.string().min(1), name: z.string().trim().min(1).optional() }),
+  z.object({ type: z.literal('image'), mediaType: z.enum(['image/png', 'image/jpeg', 'image/webp', 'image/gif']), data: z.string().min(1), name: id.optional() }),
+]);
+const pendingSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('approval'), pendingInteractionId: id, sessionId: id, prompt: z.string(), options: z.array(z.object({ outcome: z.enum(['allowed-once', 'rejected']), label: z.string() })) }),
+  z.object({ kind: z.literal('question'), pendingInteractionId: id, sessionId: id, questions: z.array(z.object({ id, question: z.string(), detail: z.string().optional(), header: z.string().optional(), options: z.array(z.object({ label: z.string(), description: z.string().optional() })), multiSelect: z.boolean() })) }),
+]);
+const waitOutputSchema = z.discriminatedUnion('state', [
+  z.object({ state: z.literal('completed'), turnRef: id, sessionId: id, hasFinalResponse: z.boolean() }),
+  z.object({ state: z.enum(['failed', 'cancelled', 'interrupted']), turnRef: id, sessionId: id, reason: reasonSchema, hasFinalResponse: z.boolean() }),
+  z.object({ state: z.literal('input_required'), turnRef: id, sessionId: id, pendingInteraction: pendingSchema }),
+  z.object({ state: z.literal('timed_out'), turnRef: id, sessionId: id, observedState: z.enum(['accepted', 'queued', 'running']) }),
+  z.object({ state: z.enum(['transport_lost', 'unknown']), turnRef: id, sessionId: id, reason: reasonSchema }),
 ]);
 
 export function registerTurnActions(server: McpServer, runtime: ActionRuntime): void {
-  registerAction(server, 'dsh.session.send_message', { description: 'Submit text or admitted image content to one explicit session and return immediately with a stable turnRef.', inputSchema: z.object({ sessionId, message: z.string().min(1).optional(), content: z.array(contentPart).min(1).optional(), mode: z.enum(['send', 'queue', 'steer']).default('send'), clientTimeZone: z.string().trim().min(1).optional() }).refine((value) => value.message !== undefined || value.content !== undefined, 'message or content is required').refine((value) => value.message === undefined || value.content === undefined, 'message and content are mutually exclusive') }, async (args, ctx) => {
-    return submitTurn(runtime, {
-      sessionId: args.sessionId,
-      content: normalizeContent(args.content, args.message),
-      mode: args.mode,
-      ...(args.clientTimeZone === undefined ? {} : { clientTimeZone: args.clientTimeZone }),
-    }, requestSignal(ctx));
-  });
+  registerAction(server, 'dsh.session.send_message', {
+    description: 'Submit text or admitted image content to one explicit session and return immediately with a process-local turnRef.',
+    inputSchema: z.object({ sessionId: id, message: z.string().min(1).optional(), content: z.array(contentPart).min(1).optional(), mode: z.enum(['steer', 'queue']).default('steer'), clientTimeZone: id.optional() })
+      .refine((value) => (value.message === undefined) !== (value.content === undefined), 'exactly one of message or content is required'),
+    outputSchema: z.object({ sessionId: id, turnRef: id, accepted: z.literal(true), mode: z.enum(['steer', 'queue']) }),
+  }, async (args, ctx) => submitTurn(runtime, {
+    sessionId: args.sessionId,
+    content: normalizeContent(args.content, args.message),
+    mode: args.mode,
+    ...(args.clientTimeZone === undefined ? {} : { clientTimeZone: args.clientTimeZone }),
+  }, requestSignal(ctx)));
 
-  registerAction(server, 'dsh.session.wait_turn', { description: 'Wait for one explicit turnRef using DSH events and recovery evidence; no periodic status polling is performed.', inputSchema: z.object({ turnRef, timeoutMs: z.number().int().positive().max(300_000).optional() }) }, (args, ctx) => waitForTurn(runtime, args.turnRef, args.timeoutMs ?? 300_000, requestSignal(ctx)));
+  registerAction(server, 'dsh.session.wait_turn', {
+    description: 'Wait for one turnRef using DSH events; one recovery read is used only if the event stream fails.',
+    inputSchema: z.object({ turnRef: id, timeoutMs: z.number().int().positive().max(300_000).optional() }),
+    outputSchema: waitOutputSchema,
+  }, (args, ctx) => waitForTurn(runtime, args.turnRef, args.timeoutMs ?? 300_000, requestSignal(ctx)));
 }
 
 export async function waitForTurn(runtime: ActionRuntime, ref: string, timeoutMs: number, signal: AbortSignal): Promise<CallToolResult> {
   const existing = runtime.turns.get(ref);
-  if (existing === undefined) return projectToolResult({ turnRef: ref, state: 'unknown', waitOutcome: 'unknown', reason: 'unknown turnRef', finalAnswer: null, pendingInteraction: null, evidence: 'incomplete' });
-  if (isTerminalState(existing.state) || existing.state === 'pending-human-input') return projectToolResult(turnResult(runtime, existing, existing.state === 'pending-human-input' ? 'pending-human-input' : 'terminal'));
+  if (existing === undefined) return toolExecutionError('turn-ref-not-found', 'The turnRef is unknown or expired.', { turnRef: ref });
+  if (isTerminalState(existing.state) || existing.state === 'pending-human-input') return waitResult(runtime, existing);
+
   return new Promise<CallToolResult>((resolve, reject) => {
     let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let recovering = false;
     let unsubscribe = (): void => undefined;
-    const finish = (value: Record<string, unknown>) => {
+    const abort = () => finish(undefined, signal.reason ?? new DOMException('Operation aborted', 'AbortError'));
+    const finish = (value?: CallToolResult, error?: unknown) => {
       if (settled) return;
       settled = true;
-      if (timer !== undefined) clearTimeout(timer);
+      clearTimeout(timer);
       unsubscribe();
-      resolve(projectToolResult(value));
+      signal.removeEventListener('abort', abort);
+      if (error !== undefined) reject(error);
+      else resolve(value!);
     };
-    timer = setTimeout(() => finish({ ...turnResult(runtime, runtime.turns.get(ref) ?? existing, 'timed-out'), waitOutcome: 'timed-out', evidence: 'incomplete' }), timeoutMs);
+    const timer = setTimeout(() => {
+      const current = runtime.turns.get(ref) ?? existing;
+      finish(waitResult(runtime, current, 'timed_out'));
+    }, timeoutMs);
+
     unsubscribe = runtime.events.subscribeSession(existing.sessionId, (event) => {
       observeEvent(runtime, event);
-      if (event.method === 'stream/error') {
-        if (event.stream === 'mux') void recoverAfterDisconnect(runtime, ref, existing, signal).then((recovered) => {
-          if (recovered !== null) finish(recovered);
-          else finish({ ...turnResult(runtime, runtime.turns.get(ref) ?? existing, 'terminal'), state: 'transport-lost', waitOutcome: 'transport-lost', evidence: 'incomplete' });
+      if (event.method === 'stream/error' && event.stream === 'mux' && !recovering) {
+        recovering = true;
+        void recoverAfterDisconnect(runtime, ref, existing, signal).then((recovered) => {
+          if (recovered !== null) finish(waitResult(runtime, recovered));
+          else {
+            const lost = runtime.turns.transition(ref, { state: 'transport-lost', reason: { kind: 'transport-lost', code: null, message: readMessage(event.payload) }, finalAnswer: runtime.turns.get(ref)?.finalAnswer ?? null, pendingInteractionId: null, evidence: 'incomplete' });
+            finish(waitResult(runtime, lost));
+          }
         });
         return;
       }
       const current = runtime.turns.get(ref);
-      if (current === undefined) return;
-      if (isTerminalState(current.state)) finish(turnResult(runtime, current, 'terminal'));
-      else if (current.state === 'pending-human-input') finish(turnResult(runtime, current, 'pending-human-input'));
+      if (current !== undefined && (isTerminalState(current.state) || current.state === 'pending-human-input')) finish(waitResult(runtime, current));
     }, signal);
-    if (signal.aborted) { unsubscribe(); if (timer !== undefined) clearTimeout(timer); reject(signal.reason ?? new DOMException('Operation aborted', 'AbortError')); }
-    else signal.addEventListener('abort', () => { unsubscribe(); if (timer !== undefined) clearTimeout(timer); reject(signal.reason ?? new DOMException('Operation aborted', 'AbortError')); }, { once: true });
+
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
   });
 }
 
-async function submitTurn(runtime: ActionRuntime, input: { sessionId: string; content: SessionPromptPart[]; mode: 'send' | 'queue' | 'steer'; clientTimeZone?: string }, signal: AbortSignal): Promise<CallToolResult> {
+async function submitTurn(runtime: ActionRuntime, input: { sessionId: string; content: SessionPromptPart[]; mode: 'queue' | 'steer'; clientTimeZone?: string }, signal: AbortSignal): Promise<CallToolResult> {
   const requestId = crypto.randomUUID();
-  const pending = runtime.turns.register({ sessionId: input.sessionId, sourceRef: `rpc:${requestId}` });
-  const response = await runtime.rpc.session.promptWithId({
-    requestId,
-    sessionId: input.sessionId,
-    mode: input.mode === 'steer' ? 'steer' : 'queue',
-    content: input.content,
-    ...(input.clientTimeZone === undefined ? {} : { clientTimeZone: input.clientTimeZone }),
-  }, signal);
+  const record = runtime.turns.register({ sessionId: input.sessionId, sourceRef: `rpc:${requestId}` });
+  const response = await runtime.rpc.session.promptWithId({ requestId, ...input }, signal);
   if (!response.result.ok) {
-    runtime.turns.reject(pending.turnRef, response.result.error.message);
-    return projectToolResult({ target: { sessionId: input.sessionId }, accepted: false, effect: 'rejected', error: { code: response.result.error.dshCode, message: response.result.error.message } });
+    runtime.turns.reject(record.turnRef, response.result.error.message);
+    return toolExecutionError(response.result.error.dshCode, response.result.error.message, { sessionId: input.sessionId });
   }
-  return projectToolResult({
-    target: { sessionId: input.sessionId },
-    accepted: true,
-    effect: input.mode === 'steer' ? 'changed' : input.mode === 'queue' ? 'queued' : 'applied',
-    turnRef: pending.turnRef,
-    state: pending.state,
-    reason: null,
-  });
+  if (input.mode === 'queue') runtime.turns.transition(record.turnRef, { state: 'queued', reason: null, finalAnswer: null, pendingInteractionId: null, evidence: 'rpc' });
+  return projectToolResult({ sessionId: input.sessionId, turnRef: record.turnRef, accepted: true, mode: input.mode }, `Message accepted in ${input.mode} mode.`);
 }
 
 export function observeEvent(runtime: ActionRuntime, event: DshEvent): void {
   const frame = unwrapEvent(event.payload);
   if (!isRecord(frame)) return;
-  const frameSessionId = typeof frame.sessionId === 'string' ? frame.sessionId : undefined;
+  const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : undefined;
   const request = isRecord(frame.request) ? frame.request : undefined;
-  if (event.method === 'approval/request' && frameSessionId !== undefined && request !== undefined) {
-    const toolName = typeof request.toolName === 'string' ? request.toolName : 'tool';
-    const reason = typeof request.reason === 'string' ? `${toolName}: ${request.reason}` : `DSH requests approval for ${toolName}`;
-    const turn = findTurnForSession(runtime, frameSessionId);
-    runtime.pending.upsert({ pendingInteractionId: event.rpcId, sessionId: frameSessionId, turnRef: turn?.turnRef ?? null, kind: 'approval', prompt: reason, options: [{ label: 'allowed-once' }, { label: 'rejected' }], expiresAt: null });
-    if (turn !== undefined) runtime.turns.transition(turn.turnRef, { state: 'pending-human-input', reason: 'approval requested', finalAnswer: turn.finalAnswer, pendingInteractionId: event.rpcId, evidence: 'event' });
-    return;
-  }
-  if (event.method === 'user-questions/request' && frameSessionId !== undefined && request !== undefined) {
-    const questions = parseQuestions(request.questions);
-    runtime.pending.upsert({ pendingInteractionId: event.rpcId, sessionId: frameSessionId, turnRef: findTurnForSession(runtime, frameSessionId)?.turnRef ?? null, kind: 'question', prompt: questions.map((question) => question.question).join('\n') || 'DSH is waiting for an answer', options: [], questions, expiresAt: null });
-    const turn = findTurnForSession(runtime, frameSessionId);
-    if (turn !== undefined) runtime.turns.transition(turn.turnRef, { state: 'pending-human-input', reason: 'question requested', finalAnswer: turn.finalAnswer, pendingInteractionId: event.rpcId, evidence: 'event' });
+  if ((event.method === 'approval/request' || event.method === 'user-questions/request') && sessionId !== undefined && request !== undefined) {
+    observeInteraction(runtime, event, sessionId, request);
     return;
   }
   if (event.method === 'remote/cancel') {
@@ -113,120 +118,93 @@ export function observeEvent(runtime: ActionRuntime, event: DshEvent): void {
     runtime.pending.remove(event.rpcId);
     return;
   }
-  const turn = findMatchingTurn(runtime, event);
-  if (turn === undefined) return;
-  const next = stateFromEvent(frame, event.rpcId, turn.finalAnswer);
-  if (next === null) return;
-  runtime.turns.transition(turn.turnRef, next);
+
+  for (const turn of findMatchingTurns(runtime, frame)) {
+    const next = stateFromEvent(frame, turn.finalAnswer);
+    if (next !== null) runtime.turns.transition(turn.turnRef, next);
+  }
 }
 
-async function recoverAfterDisconnect(runtime: ActionRuntime, ref: string, record: TurnRecord, signal: AbortSignal): Promise<Record<string, unknown> | null> {
+async function recoverAfterDisconnect(runtime: ActionRuntime, ref: string, record: TurnRecord, signal: AbortSignal): Promise<TurnRecord | null> {
   if (signal.aborted) return null;
   const snapshot = await runtime.events.sessionSnapshot(record.sessionId, 200, signal).catch(() => null);
   if (snapshot === null) return null;
   const projection = classifyHistoryTurn({ records: snapshot.records, hasMore: snapshot.hasMore }, ref, record.sessionId, record.sourceRef);
-  if (projection === null) return null;
-  const updated = runtime.turns.transition(ref, projection);
-  return turnResult(runtime, updated, 'terminal');
+  return projection === null ? null : runtime.turns.transition(ref, projection);
 }
 
-function findMatchingTurn(runtime: ActionRuntime, event: DshEvent): TurnRecord | undefined {
-  const frame = unwrapEvent(event.payload);
-  if (!isRecord(frame)) return undefined;
+function findMatchingTurns(runtime: ActionRuntime, frame: Record<string, unknown>): TurnRecord[] {
   const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : undefined;
-  if (sessionId === undefined) return undefined;
-  const eventValue = frame.type === 'session/event' && isRecord(frame.event) ? frame.event : frame;
-  const eventData = isRecord(eventValue.data) ? eventValue.data : {};
-  const type = typeof eventValue.type === 'string' ? eventValue.type : '';
-  if (type === 'turn/start' && typeof eventData.turn === 'number') {
-    runtime.turns.observeDshTurnStart(sessionId, eventData.turn);
-    return undefined;
+  if (sessionId === undefined) return [];
+  const data = isRecord(frame.data) ? frame.data : {};
+  if (frame.type === 'turn/start' && typeof data.turn === 'number') {
+    runtime.turns.observeDshTurnStart(sessionId, data.turn);
+    return [];
   }
-  if (type === 'user/message' && isRecord(eventData.source) && typeof eventData.source.rpcId === 'string') {
-    return runtime.turns.bindRequestToOpenTurn(sessionId, eventData.source.rpcId);
+  if (frame.type === 'user/message' && isRecord(data.source) && typeof data.source.rpcId === 'string') {
+    const record = runtime.turns.bindRequestToOpenTurn(sessionId, data.source.rpcId);
+    return record === undefined ? [] : [record];
   }
-  if (typeof eventData.turn === 'number') return runtime.turns.findByDshTurn(sessionId, eventData.turn);
-  return undefined;
+  return typeof data.turn === 'number' ? runtime.turns.findByDshTurn(sessionId, data.turn) : [];
 }
 
-function findTurnForSession(runtime: ActionRuntime, sessionId: string): TurnRecord | undefined {
-  return runtime.turns.all().find((record) => record.sessionId === sessionId && !isTerminalState(record.state));
+function stateFromEvent(event: Record<string, unknown>, previousAnswer: string | null): Pick<TurnRecord, 'state' | 'reason' | 'finalAnswer' | 'pendingInteractionId' | 'evidence'> | null {
+  const data = isRecord(event.data) ? event.data : {};
+  if (event.type === 'turn/end') return { ...terminalFromReason(data.reason), finalAnswer: previousAnswer, pendingInteractionId: null, evidence: 'event' };
+  if (event.type === 'turn/start' || event.type === 'user/message') return { state: 'running', reason: null, finalAnswer: previousAnswer, pendingInteractionId: null, evidence: 'event' };
+  if (event.type === 'assistant/message') return { state: 'running', reason: null, finalAnswer: visibleAssistantText(event) ?? previousAnswer, pendingInteractionId: null, evidence: 'event' };
+  return null;
 }
 
-function stateFromEvent(frame: Record<string, unknown>, pendingId: string, previousAnswer: string | null): Pick<TurnRecord, 'state' | 'reason' | 'finalAnswer' | 'pendingInteractionId' | 'evidence'> | null {
-  const eventValue = frame.type === 'session/event' && isRecord(frame.event) ? frame.event : frame;
-  const type = typeof eventValue.type === 'string' ? eventValue.type : '';
-  const data = isRecord(eventValue.data) ? eventValue.data : eventValue;
-  const answer = extractAssistantText(eventValue) ?? previousAnswer;
-  const state = normalizeState(data.state ?? data.status ?? inferTurnState(type, data));
-  if (state === null) return answer === previousAnswer ? null : { state: 'running', reason: null, finalAnswer: answer, pendingInteractionId: null, evidence: 'event' };
-  return { state, reason: boundedReason(data.reason ?? data.error), finalAnswer: answer, pendingInteractionId: state === 'pending-human-input' ? pendingId : null, evidence: 'event' };
+function observeInteraction(runtime: ActionRuntime, event: DshEvent, sessionId: string, request: Record<string, unknown>): void {
+  const turn = runtime.turns.all().find((record) => record.sessionId === sessionId && !isTerminalState(record.state));
+  const questions = event.method === 'user-questions/request' ? parseQuestions(request.questions) : undefined;
+  const toolName = typeof request.toolName === 'string' ? request.toolName : 'tool';
+  const prompt = questions?.map((question) => question.question).join('\n') || (typeof request.reason === 'string' ? `${toolName}: ${request.reason}` : `DSH requests approval for ${toolName}`);
+  runtime.pending.upsert({ pendingInteractionId: event.rpcId, sessionId, turnRef: turn?.turnRef ?? null, kind: questions === undefined ? 'approval' : 'question', prompt, options: questions === undefined ? [{ label: 'allowed-once' }, { label: 'rejected' }] : [], ...(questions === undefined ? {} : { questions }), expiresAt: null });
+  if (turn !== undefined) runtime.turns.transition(turn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: turn.finalAnswer, pendingInteractionId: event.rpcId, evidence: 'event' });
 }
 
-function inferTurnState(type: string, data: Record<string, unknown>): TurnState | undefined {
-  if (type === 'turn/start') return 'running';
-  if (type === 'user/message') return 'running';
-  if (type === 'assistant/message') return 'running';
-  if (type !== 'turn/end') return undefined;
-  const reason = isRecord(data.reason) && typeof data.reason.kind === 'string' ? data.reason.kind : '';
-  if (reason === 'aborted') return isRecord(data.reason) && isRecord(data.reason.reason) && data.reason.reason.kind === 'user' ? 'cancelled' : 'interrupted';
-  if (reason === 'interrupted') return 'interrupted';
-  if (reason === 'error' || reason === 'blocked' || reason === 'max-tokens') return 'failed';
-  return 'completed';
+function waitResult(runtime: ActionRuntime, record: TurnRecord, outcome?: 'timed_out'): CallToolResult {
+  let metadata: Record<string, unknown>;
+  if (outcome === 'timed_out') {
+    metadata = { state: 'timed_out', turnRef: record.turnRef, sessionId: record.sessionId, observedState: record.state };
+  } else if (record.state === 'pending-human-input') {
+    const pending = record.pendingInteractionId === null ? undefined : runtime.pending.get(record.pendingInteractionId);
+    metadata = pending === undefined
+      ? { state: 'unknown', turnRef: record.turnRef, sessionId: record.sessionId, reason: { kind: 'interaction-missing', code: null, message: 'The pending interaction is unavailable.' } }
+      : { state: 'input_required', turnRef: record.turnRef, sessionId: record.sessionId, pendingInteraction: publicPendingInteraction(pending) };
+  } else if (record.state === 'completed') {
+    metadata = { state: 'completed', turnRef: record.turnRef, sessionId: record.sessionId, hasFinalResponse: record.finalAnswer !== null };
+  } else if (record.state === 'failed' || record.state === 'cancelled' || record.state === 'interrupted') {
+    metadata = { state: record.state, turnRef: record.turnRef, sessionId: record.sessionId, reason: ensuredReason(record.reason, record.state), hasFinalResponse: record.finalAnswer !== null };
+  } else if (record.state === 'transport-lost') {
+    metadata = { state: 'transport_lost', turnRef: record.turnRef, sessionId: record.sessionId, reason: ensuredReason(record.reason, 'transport-lost') };
+  } else {
+    metadata = { state: 'unknown', turnRef: record.turnRef, sessionId: record.sessionId, reason: ensuredReason(record.reason, 'unknown') };
+  }
+  return { structuredContent: metadata, content: [{ type: 'text', text: record.finalAnswer ?? waitSummary(metadata) }] };
 }
 
-function extractAssistantText(value: Record<string, unknown>): string | null {
-  if (value.type !== 'assistant/message' || !isRecord(value.data) || !isRecord(value.data.message) || !Array.isArray(value.data.message.content)) return null;
-  const text = value.data.message.content.filter(isRecord).filter((part) => part.type === 'text' && typeof part.text === 'string').map((part) => part.text as string).join('');
-  return text === '' ? null : truncate(text);
+function ensuredReason(value: TerminalReason | null, kind: string): TerminalReason {
+  return value ?? { kind, code: null, message: null };
 }
 
-function turnResult(runtime: ActionRuntime, record: TurnRecord, waitOutcome: 'terminal' | 'pending-human-input' | 'timed-out'): Record<string, unknown> {
-  return { turnRef: record.turnRef, sessionId: record.sessionId, state: record.state, waitOutcome, reason: record.reason, finalAnswer: record.finalAnswer, pendingInteraction: record.pendingInteractionId === null ? null : runtime.pending.get(record.pendingInteractionId) ?? { pendingInteractionId: record.pendingInteractionId }, evidence: record.evidence };
+function waitSummary(value: Record<string, unknown>): string {
+  if (value.state === 'input_required' && isRecord(value.pendingInteraction)) return value.pendingInteraction.kind === 'approval' ? 'DSH requires approval.' : 'DSH requires an answer.';
+  return `DSH turn ${String(value.state).replace('_', ' ')}.`;
 }
 
 function parseQuestions(value: unknown): PendingQuestion[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((question) => {
     if (!isRecord(question) || typeof question.id !== 'string' || typeof question.question !== 'string') return [];
-    const intent = isRecord(question.intent) && question.intent.kind === 'plan-review' && typeof question.intent.approve === 'string'
-      ? { kind: 'plan-review' as const, approve: question.intent.approve }
-      : undefined;
-    return [{
-      id: question.id,
-      question: question.question,
-      ...(typeof question.detail === 'string' ? { detail: question.detail } : {}),
-      ...(typeof question.header === 'string' ? { header: question.header } : {}),
-      options: Array.isArray(question.options) ? question.options.filter(isRecord).flatMap((option) => typeof option.label === 'string' ? [{ label: option.label, ...(typeof option.description === 'string' ? { description: option.description } : {}) }] : []) : [],
-      multiSelect: question.multiSelect === true,
-      ...(intent === undefined ? {} : { intent }),
-    }];
+    return [{ id: question.id, question: question.question, ...(typeof question.detail === 'string' ? { detail: question.detail } : {}), ...(typeof question.header === 'string' ? { header: question.header } : {}), options: Array.isArray(question.options) ? question.options.filter(isRecord).flatMap((option) => typeof option.label === 'string' ? [{ label: option.label, ...(typeof option.description === 'string' ? { description: option.description } : {}) }] : []) : [], multiSelect: question.multiSelect === true }];
   });
 }
 
-function normalizeState(value: unknown): TurnState | null {
-  return value === 'accepted' || value === 'queued' || value === 'running' || value === 'pending-human-input' || value === 'completed' || value === 'failed' || value === 'cancelled' || value === 'interrupted' || value === 'transport-lost' || value === 'unknown' ? value : null;
-}
-
-function boundedReason(value: unknown): string | null {
-  if (typeof value === 'string') return truncate(value);
-  if (isRecord(value)) {
-    const kind = typeof value.kind === 'string' ? value.kind : null;
-    const message = typeof value.message === 'string'
-      ? value.message
-      : typeof value.error === 'string'
-        ? value.error
-        : isRecord(value.error) && typeof value.error.message === 'string'
-          ? value.error.message
-          : null;
-    if (kind !== null && message !== null) return truncate(`${kind}: ${message}`);
-    if (kind !== null) return truncate(kind);
-  }
-  return null;
-}
-
-function truncate(value: string): string {
-  return value.length <= 4_000 ? value : `${value.slice(0, 3_999)}…`;
+function normalizeContent(content: Array<{ type: 'text'; text: string } | { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; data: string; name?: string | undefined }> | undefined, message: string | undefined): SessionPromptPart[] {
+  return content?.map((part) => part.type === 'text' ? part : { type: 'image', mediaType: part.mediaType, data: part.data, ...(part.name === undefined ? {} : { name: part.name }) }) ?? [{ type: 'text', text: message ?? '' }];
 }
 
 function unwrapEvent(value: unknown): unknown {
@@ -234,11 +212,10 @@ function unwrapEvent(value: unknown): unknown {
   return value.type === 'session/event' && isRecord(value.event) ? { ...value.event, sessionId: value.sessionId } : value;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+function readMessage(value: unknown): string | null {
+  return isRecord(value) && typeof value.message === 'string' ? value.message : null;
 }
 
-function normalizeContent(content: Array<{ type: 'text'; text: string } | { type: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'; data: string; name?: string | undefined }> | undefined, message: string | undefined): SessionPromptPart[] {
-  if (content !== undefined) return content.map((part) => part.type === 'text' ? part : { type: 'image', mediaType: part.mediaType, data: part.data, ...(part.name === undefined ? {} : { name: part.name }) });
-  return [{ type: 'text', text: message ?? '' }];
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
