@@ -1,5 +1,5 @@
 import type { DshConfig } from '../config.js';
-import { DshDomainError, DshProtocolError, DshTransportError, isAbortError, toDshDomainError } from '../errors.js';
+import { DshDomainError, DshProtocolError, DshTransportError, isAbortError } from '../errors.js';
 import { DshAuthSession, type FetchLike } from './auth.js';
 
 export interface RpcSuccess<T> { ok: true; value: T; }
@@ -11,8 +11,6 @@ export interface DshSessionSummary {
   updatedAt: number;
   running: boolean;
   blank: boolean;
-  parentSessionId?: string;
-  origin?: 'subagent';
   cwd?: string;
   projections?: { asOfSeq: number; values: Record<string, unknown> };
 }
@@ -22,16 +20,13 @@ export interface SessionHistoryRecord { type: 'event' | 'chunks'; event: Record<
 export interface SessionPageValue { records: SessionHistoryRecord[]; hasMore: boolean; }
 export interface ModelSelection { provider: string; model: string; reasoningEffort?: string; }
 export interface SessionModelsValue {
-  default: ModelSelection;
   routableProviders: string[];
   groups: Array<Record<string, unknown>>;
-  failures: Array<Record<string, unknown>>;
 }
 export interface WorkspaceArchiveValue { archivedSessionIds: string[]; }
 export interface CommandExecution {
-  commandId: string;
   result:
-    | { kind: 'success'; text?: string; sourceEventSeq?: number }
+    | { kind: 'success'; text?: string }
     | { kind: 'error'; text: string };
 }
 
@@ -53,7 +48,6 @@ export interface RemoteEventResult {
   outcome:
     | { kind: 'next' }
     | { kind: 'result'; value?: unknown }
-    | { kind: 'rejected'; error: { name: string; message: string; code?: string; details?: unknown } };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -72,7 +66,7 @@ export class DshRpcClient {
     this.auth = fetchOrAuth instanceof DshAuthSession ? fetchOrAuth : new DshAuthSession(config, fetchOrAuth);
   }
 
-  async callWithId<T>(endpoint: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ rpcId: string; result: RpcResult<T> }> {
+  async call<T>(endpoint: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult<T>> {
     const rpcId = crypto.randomUUID();
     const body = { type: 'client-request', rpcId, method: endpoint, payload: { args } };
     let response: Response;
@@ -107,19 +101,9 @@ export class DshRpcClient {
       if (!isRecord(error) || typeof error.code !== 'string' || typeof error.message !== 'string') {
         throw new DshProtocolError('DSH returned an invalid domain error', { endpoint });
       }
-      return {
-        rpcId,
-        result: {
-          ok: false,
-          error: toDshDomainError({ code: error.code, message: error.message, details: isRecord(error.details) ? error.details : {} }),
-        },
-      };
+      return { ok: false, error: new DshDomainError(error.code, error.message, isRecord(error.details) ? error.details : {}) };
     }
-    return { rpcId, result: { ok: true, value: envelope.result.value as T } };
-  }
-
-  async call<T>(endpoint: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult<T>> {
-    return (await this.callWithId<T>(endpoint, args, signal)).result;
+    return { ok: true, value: envelope.result.value as T };
   }
 
   session = {
@@ -135,7 +119,7 @@ export class DshRpcClient {
     }, signal),
     modelCatalog: (signal?: AbortSignal) => this.call<SessionModelsValue>('session/modelCatalog', {}, signal),
     selectModel: (request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }, signal?: AbortSignal) => this.call<{ selected: ModelSelection }>('session/selectModel', { request }, signal),
-    promptWithId: (request: SessionPromptPayload, signal?: AbortSignal) => this.callWithId<{ accepted: true }>('session/prompt', { request }, signal),
+    prompt: (request: SessionPromptPayload, signal?: AbortSignal) => this.call<{ accepted: true }>('session/prompt', { request }, signal),
     cancel: (request: { sessionId: string }, signal?: AbortSignal) => this.call<{ accepted: true }>('session/cancel', { request }, signal),
   };
 

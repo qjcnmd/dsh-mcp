@@ -4,7 +4,6 @@ import { loadConfig } from '../../src/config.js';
 import { createMcpServer, createRuntime } from '../../src/mcp/transport.js';
 import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
-import { PageContextStore } from '../../src/domain/page-context.js';
 
 const EXPECTED_TOOLS = [
   'dsh.workspace.list',
@@ -113,12 +112,11 @@ describe('public tool surface', () => {
     let activated = 0;
     const turns = new TurnStore();
     const active = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:test' });
-    turns.transition(active.turnRef, { state: 'running', reason: null, finalAnswer: null, pendingInteractionId: null, evidence: 'event' });
+    turns.transition(active.turnRef, { state: 'running', reason: null, finalAnswer: null, pendingInteractionId: null });
     const runtime = {
-      config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }),
       turns,
       pending: new PendingInteractionStore(),
-      page: new PageContextStore(),
+      selectedSessionId: null,
       rpc: {
         session: {
           list: async () => ({ ok: true, value: { items: [{ sessionId: 'session-test', updatedAt: 1, running: false, blank: true, projections: { asOfSeq: 1, values: { modelSelection: { lastUsed: null, next: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' } } } } }] } }),
@@ -146,11 +144,11 @@ describe('public tool surface', () => {
   it('returns content-free snapshots, normalized context statistics, and compact selected context', async () => {
     const turns = new TurnStore();
     const active = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:test' });
-    turns.transition(active.turnRef, { state: 'running', reason: null, finalAnswer: 'must not leak', pendingInteractionId: null, evidence: 'event' });
+    turns.transition(active.turnRef, { state: 'running', reason: null, finalAnswer: 'must not leak', pendingInteractionId: null });
     const workspaces = { items: [{ workspaceId: 'w', title: 'Workspace', path: 'C:\\work', sessionIds: ['session-test'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' }], archivedSessionIds: [] };
     const rawSession = { sessionId: 'session-test', updatedAt: 10, running: true, blank: false, cwd: 'C:\\work', projections: { asOfSeq: 9, values: { title: 'Session', agentPreset: 'simple', contextPressure: { pressureTokens: 25, contextWindow: 100 } } } };
     const runtime = {
-      config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }), turns, pending: new PendingInteractionStore(), page: new PageContextStore(),
+      turns, pending: new PendingInteractionStore(), selectedSessionId: null,
       rpc: { session: { list: async () => ({ ok: true, value: { items: [rawSession] } }) } },
       events: { workspaceSnapshot: async () => workspaces, sessionSnapshot: async () => ({ cursor: 9, hasMore: false, header: {}, records: [{ type: 'event', event: { seq: 8, time: 80, type: 'assistant/message', surfaceOp: 'append', data: { turn: 2, message: { content: [{ type: 'text', text: 'conversation must not leak' }] } } } }], projections: { asOfSeq: 9, values: rawSession.projections.values } }) },
     } as never;
@@ -170,11 +168,11 @@ describe('public tool surface', () => {
     const turns = new TurnStore();
     const pending = new PendingInteractionStore();
     const approvalTurn = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:approval' });
-    turns.transition(approvalTurn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'approval', evidence: 'event' });
-    pending.upsert({ pendingInteractionId: 'approval', sessionId: 'session-test', turnRef: approvalTurn.turnRef, kind: 'approval', prompt: 'Allow shell?', options: [{ label: 'allowed-once' }, { label: 'rejected' }], expiresAt: null });
+    turns.transition(approvalTurn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'approval' });
+    pending.upsert({ pendingInteractionId: 'approval', sessionId: 'session-test', turnRef: approvalTurn.turnRef, kind: 'approval', prompt: 'Allow shell?', options: [{ label: 'allowed-once' }, { label: 'rejected' }] });
     const values: unknown[] = [];
     const runtime = {
-      config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }), turns, pending, page: new PageContextStore(), rpc: {},
+      turns, pending, selectedSessionId: null, rpc: {},
       events: { respondRemoteInteraction: async (_id: string, value: unknown) => { values.push(value); return { ok: true, value: undefined }; } },
     } as never;
     expect((await callTool(runtime, 'dsh.session.respond_approval', { sessionId: 'other', pendingInteractionId: 'approval', outcome: 'allowed-once' }))).toMatchObject({ isError: true, structuredContent: { error: { code: 'pending-interaction-mismatch' } } });
@@ -184,8 +182,8 @@ describe('public tool surface', () => {
     expect((await callTool(runtime, 'dsh.session.respond_approval', { sessionId: 'session-test', pendingInteractionId: 'approval', outcome: 'rejected' }))).toMatchObject({ isError: true, structuredContent: { error: { code: 'pending-interaction-not-found' } } });
 
     const questionTurn = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:question' });
-    turns.transition(questionTurn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'question', evidence: 'event' });
-    pending.upsert({ pendingInteractionId: 'question', sessionId: 'session-test', turnRef: questionTurn.turnRef, kind: 'question', prompt: 'Choose', options: [], questions: [{ id: 'q', question: 'Choose', options: [{ label: 'yes' }], multiSelect: false }], expiresAt: null });
+    turns.transition(questionTurn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'question' });
+    pending.upsert({ pendingInteractionId: 'question', sessionId: 'session-test', turnRef: questionTurn.turnRef, kind: 'question', prompt: 'Choose', options: [], questions: [{ id: 'q', question: 'Choose', options: [{ label: 'yes' }], multiSelect: false }] });
     const answer = await callTool(runtime, 'dsh.session.answer_question', { sessionId: 'session-test', pendingInteractionId: 'question', answers: [{ id: 'q', selected: ['yes'] }] });
     expect(answer.structuredContent).toEqual({ sessionId: 'session-test', pendingInteractionId: 'question', accepted: true });
     expect(values).toEqual(['allowed-once', { answers: [{ id: 'q', selected: ['yes'] }] }]);
@@ -216,12 +214,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function collectionRuntime(sessions: unknown[], workspaces: unknown) {
   return {
-    config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }),
     rpc: { session: { list: async () => ({ ok: true, value: { items: sessions } }) } },
     events: { workspaceSnapshot: async () => workspaces },
     turns: new TurnStore(),
     pending: new PendingInteractionStore(),
-    page: new PageContextStore(),
+    selectedSessionId: null,
   } as never;
 }
 

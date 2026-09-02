@@ -19,7 +19,7 @@ export function classifyHistoryTurn(history: SessionPageValue, turnRef: string, 
       finalAnswer = visibleAssistantText(event) ?? finalAnswer;
     } else if (matchedTurn !== undefined && data.turn === matchedTurn && event.type === 'turn/end') {
       const terminal = terminalFromReason(data.reason);
-      return { turnRef, sessionId, ...terminal, finalAnswer, pendingInteractionId: null, observedAt: now, evidence: 'recovered' };
+      return { turnRef, sessionId, ...terminal, finalAnswer, pendingInteractionId: null, observedAt: now };
     }
   }
   return null;

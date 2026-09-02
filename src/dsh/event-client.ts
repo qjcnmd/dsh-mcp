@@ -12,8 +12,6 @@ export interface DshEvent {
   rpcId: string;
   method: string;
   payload: unknown;
-  order: number;
-  receivedAt: string;
 }
 
 export type DshEventListener = (event: DshEvent) => void;
@@ -98,12 +96,10 @@ export class DshEventClient {
   private readonly auth: DshAuthSession;
   private readonly rpc: DshRpcClient;
   private readonly listeners = new Set<DshEventListener>();
-  private readonly streamControllers = new Set<AbortController>();
   private readonly remoteSessionRefs = new Map<string, number>();
   private readonly remoteInteractions = new Map<string, RemoteInteractionRef>();
   private remoteController: AbortController | undefined;
   private remoteClientId: string | undefined;
-  private order = 0;
 
   constructor(private readonly config: DshConfig, fetchOrAuth: FetchLike | DshAuthSession = globalThis.fetch) {
     this.auth = fetchOrAuth instanceof DshAuthSession ? fetchOrAuth : new DshAuthSession(config, fetchOrAuth);
@@ -129,7 +125,6 @@ export class DshEventClient {
 
   subscribeSession(sessionId: string, listener: DshEventListener, signal?: AbortSignal): () => void {
     const controller = new AbortController();
-    this.streamControllers.add(controller);
     const forward: DshEventListener = (event) => {
       const payload = isRecord(event.payload) ? event.payload : undefined;
       if (payload?.sessionId === sessionId) listener(event);
@@ -150,7 +145,6 @@ export class DshEventClient {
       if (stopped) return;
       stopped = true;
       controller.abort();
-      this.streamControllers.delete(controller);
       this.listeners.delete(forward);
       this.releaseRemoteEvents(sessionId);
     };
@@ -172,17 +166,6 @@ export class DshEventClient {
       this.maybeStopRemoteEvents();
     }
     return result;
-  }
-
-  async stop(): Promise<void> {
-    for (const controller of [...this.streamControllers]) controller.abort();
-    this.streamControllers.clear();
-    this.remoteController?.abort();
-    this.remoteController = undefined;
-    this.remoteClientId = undefined;
-    this.remoteSessionRefs.clear();
-    this.remoteInteractions.clear();
-    this.listeners.clear();
   }
 
   private async firstFrame(endpoint: string, payload: Record<string, unknown>, accepts: (value: unknown) => boolean, signal?: AbortSignal): Promise<unknown> {
@@ -240,7 +223,7 @@ export class DshEventClient {
     if (value.type === 'cancel' && typeof value.eventId === 'string') {
       const ref = this.remoteInteractions.get(value.eventId);
       this.remoteInteractions.delete(value.eventId);
-      if (ref !== undefined) this.emit({ stream: 'host', rpcId: value.eventId, method: 'remote/cancel', payload: { sessionId: ref.sessionId }, order: this.nextOrder(), receivedAt: new Date().toISOString() });
+      if (ref !== undefined) this.emit({ stream: 'host', rpcId: value.eventId, method: 'remote/cancel', payload: { sessionId: ref.sessionId } });
       this.maybeStopRemoteEvents();
       return;
     }
@@ -262,15 +245,12 @@ export class DshEventClient {
       rpcId: ref.eventId,
       method: ref.event,
       payload: { type: 'remote/invocation', sessionId: ref.sessionId, clientId: ref.clientId, eventId: ref.eventId, request: value.request },
-      order: this.nextOrder(),
-      receivedAt: new Date().toISOString(),
     });
   }
 
   private emitSessionFollow(value: unknown, sessionId: string): void {
     if (isSessionSnapshot(value)) {
       for (const record of value.records) this.emitHistoryRecord(record, sessionId);
-      this.emit({ stream: 'mux', rpcId: '', method: 'session/snapshot', payload: { ...value, sessionId }, order: this.nextOrder(), receivedAt: new Date().toISOString() });
       return;
     }
     this.emitHistoryRecord(value, sessionId);
@@ -278,7 +258,7 @@ export class DshEventClient {
 
   private emitHistoryRecord(value: unknown, sessionId: string): void {
     if (!isRecord(value) || value.type !== 'event' || !isRecord(value.event)) return;
-    this.emit({ stream: 'mux', rpcId: '', method: 'session/follow', payload: { type: 'session/event', sessionId, event: value.event }, order: this.nextOrder(), receivedAt: new Date().toISOString() });
+    this.emit({ stream: 'mux', rpcId: '', method: 'session/follow', payload: { type: 'session/event', sessionId, event: value.event } });
   }
 
   private emitStreamError(stream: DshEventStream, endpoint: string, error: unknown, sessionId?: string): void {
@@ -287,17 +267,11 @@ export class DshEventClient {
       rpcId: '',
       method: 'stream/error',
       payload: { endpoint, ...(sessionId === undefined ? {} : { sessionId }), message: error instanceof Error ? error.message : String(error) },
-      order: this.nextOrder(),
-      receivedAt: new Date().toISOString(),
     });
   }
 
   private emit(event: DshEvent): void {
     for (const listener of [...this.listeners]) listener(event);
-  }
-
-  private nextOrder(): number {
-    return ++this.order;
   }
 
   private async runLogicalStream(endpoint: string, payload: Record<string, unknown>, onItem: (value: unknown) => void, signal: AbortSignal): Promise<void> {

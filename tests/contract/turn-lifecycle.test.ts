@@ -1,12 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
-import { loadConfig } from '../../src/config.js';
 import type { DshEvent as Event } from '../../src/dsh/event-client.js';
 import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
 import { classifyHistoryTurn } from '../../src/dsh/recovery.js';
 import { observeEvent, waitForTurn } from '../../src/mcp/actions/turns.js';
-import { PageContextStore } from '../../src/domain/page-context.js';
 import { createMcpServer } from '../../src/mcp/transport.js';
 
 describe('turn lifecycle projection', () => {
@@ -21,7 +19,6 @@ describe('turn lifecycle projection', () => {
     expect(result.sourceRef).toBe('dsh-turn:7');
     expect(result.state).toBe('completed');
     expect(result.finalAnswer).toBe('done');
-    expect(result.evidence).toBe('event');
   });
 
   it('classifies failure, cancellation, and returns an answerable pending question without polling', async () => {
@@ -101,7 +98,7 @@ describe('turn lifecycle projection', () => {
     const runtime = makeRuntime();
     const text = 'x'.repeat(5_000);
     const record = runtime.turns.register({ sessionId: 'session-test', sourceRef: 'rpc:test' });
-    runtime.turns.transition(record.turnRef, { state: 'completed', reason: null, finalAnswer: text, pendingInteractionId: null, evidence: 'event' });
+    runtime.turns.transition(record.turnRef, { state: 'completed', reason: null, finalAnswer: text, pendingInteractionId: null });
     const completed = await waitForTurn(runtime, record.turnRef, 100, new AbortController().signal);
     expect(completed.structuredContent).toEqual({ state: 'completed', turnRef: record.turnRef, sessionId: 'session-test', hasFinalResponse: true });
     expect(completed.content).toEqual([{ type: 'text', text }]);
@@ -160,7 +157,7 @@ describe('turn lifecycle projection', () => {
     const middle = [record(4, 'turn/start', { turn: 2 }), record(5, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'two' }, { type: 'image', data: 'not-returned' }] }, 'append'), record(6, 'assistant/chunk', { turn: 2, chunk: { type: 'reasoning-delta', text: 'hidden' } }), record(7, 'tool/result', { turn: 2, message: { content: [{ type: 'text', text: 'secret tool output' }] } }, 'append'), record(8, 'assistant/message', { turn: 2, message: { content: [{ type: 'reasoning', text: 'hidden reasoning' }, { type: 'text', text: 'answer two' }] } }, 'append'), record(9, 'turn/end', { turn: 2, reason: { kind: 'error', error: { code: 'P1', message: 'provider failed' } } }), record(10, 'turn/start', { turn: 3 }), record(11, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'three' }] }, 'append')];
     const recent = [record(12, 'assistant/message', { turn: 3, message: { content: [{ type: 'text', text: finalText }] } }, 'append'), record(13, 'turn/end', { turn: 3, reason: { kind: 'completed' } })];
     const runtime = {
-      config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }), turns: new TurnStore(), pending: new PendingInteractionStore(), page: new PageContextStore(),
+      turns: new TurnStore(), pending: new PendingInteractionStore(), selectedSessionId: null,
       events: { sessionSnapshot: async () => ({ cursor: 13, records: recent, hasMore: true, header: {}, projections: { asOfSeq: 13, values: {} } }) },
       rpc: { session: { page: async (request: { throughSeq: number; beforeSeq?: number }) => { pages.push(request); return request.beforeSeq === 12 ? { ok: true, value: { records: middle, hasMore: true } } : { ok: true, value: { records: turn1, hasMore: false } }; } } },
     } as never;
@@ -182,11 +179,11 @@ describe('turn lifecycle projection', () => {
 });
 
 function makeRuntime() {
-  return { config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }), turns: new TurnStore(), pending: new PendingInteractionStore(), rpc: { session: { history: async () => ({ ok: false, error: { dshCode: 'not-called', message: 'not called' } }) } }, events: { subscribe: () => () => undefined } } as never;
+  return { turns: new TurnStore(), pending: new PendingInteractionStore(), selectedSessionId: null, rpc: { session: { history: async () => ({ ok: false, error: { dshCode: 'not-called', message: 'not called' } }) } }, events: { subscribe: () => () => undefined } } as never;
 }
 
 function event(rpcId: string, payload: unknown, method = 'session/follow'): Event {
-  return { stream: 'mux', rpcId, method, payload, order: 1, receivedAt: new Date().toISOString() };
+  return { stream: 'mux', rpcId, method, payload };
 }
 
 function historyEvent(type: string, data: Record<string, unknown>, surfaceOp?: 'append') {

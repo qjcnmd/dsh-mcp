@@ -40,16 +40,6 @@ export class DshDomainError extends DshMcpError {
   }
 }
 
-export interface DshRpcErrorBody {
-  code: string;
-  message: string;
-  details?: ErrorDetails;
-}
-
-export function toDshDomainError(error: DshRpcErrorBody): DshDomainError {
-  return new DshDomainError(error.code, error.message, error.details);
-}
-
 export function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }

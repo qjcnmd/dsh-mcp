@@ -4,7 +4,6 @@ import { DshRpcClient } from '../../src/dsh/rpc-client.js';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
-import { PageContextStore } from '../../src/domain/page-context.js';
 import { createMcpServer } from '../../src/mcp/transport.js';
 import { jsonResponse } from '../unit/fixtures.js';
 
@@ -42,16 +41,16 @@ describe('current DSH RPC wire contract', () => {
       return jsonResponse({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: { accepted: true } } });
     });
 
-    const response = await client.session.promptWithId({
+    const response = await client.session.prompt({
       requestId: 'prompt-1',
       sessionId: 'session-test',
       mode: 'queue',
       content: [{ type: 'text', text: 'hello' }],
     });
 
-    expect(response.result).toEqual({ ok: true, value: { accepted: true } });
+    expect(response).toEqual({ ok: true, value: { accepted: true } });
     expect(body).toMatchObject({
-      rpcId: response.rpcId,
+      rpcId: expect.any(String),
       method: 'session/prompt',
       payload: { args: { request: { requestId: 'prompt-1', sessionId: 'session-test', mode: 'queue', content: [{ type: 'text', text: 'hello' }] } } },
     });
@@ -60,11 +59,10 @@ describe('current DSH RPC wire contract', () => {
   it('sends omitted mode as steer and preserves explicit queue', async () => {
     const modes: string[] = [];
     const runtime = {
-      config,
       turns: new TurnStore(),
       pending: new PendingInteractionStore(),
-      page: new PageContextStore(),
-      rpc: { session: { promptWithId: async (request: { mode: string }) => { modes.push(request.mode); return { rpcId: crypto.randomUUID(), result: { ok: true, value: { accepted: true } } }; } } },
+      selectedSessionId: null,
+      rpc: { session: { prompt: async (request: { mode: string }) => { modes.push(request.mode); return { ok: true, value: { accepted: true } }; } } },
       events: {},
     } as never;
     const first = await callTool(runtime, { sessionId: 'session-test', message: 'first' });
@@ -110,8 +108,7 @@ describe('current DSH RPC wire contract', () => {
   it('returns tool errors for DSH command failures and unknown commands', async () => {
     let value: unknown = undefined;
     const runtime = {
-      config,
-      turns: new TurnStore(), pending: new PendingInteractionStore(), page: new PageContextStore(), events: {},
+      turns: new TurnStore(), pending: new PendingInteractionStore(), selectedSessionId: null, events: {},
       rpc: { commands: { execute: async () => ({ ok: true, value }) } },
     } as never;
     const unknown = await callTool(runtime, { sessionId: 'session-test', command: '/missing' }, 'dsh.session.command');

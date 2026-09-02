@@ -1,16 +1,13 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
-
-const sessionId = z.string().trim().min(1);
-const pendingInteractionId = z.string().trim().min(1);
+import { idSchema, projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
 
 export function registerInterventionActions(server: McpServer, runtime: ActionRuntime): void {
   registerAction(server, 'dsh.session.cancel', {
     description: 'Cancel the active turn for one explicitly targeted session while preserving queued work.',
-    inputSchema: z.object({ sessionId }),
-    outputSchema: z.object({ sessionId, cancellationRequested: z.literal(true) }),
+    inputSchema: z.object({ sessionId: idSchema }),
+    outputSchema: z.object({ sessionId: idSchema, cancellationRequested: z.literal(true) }),
   }, async (args, ctx) => {
     const result = await runtime.rpc.session.cancel(args, requestSignal(ctx));
     if (!result.ok) return toolExecutionError(result.error.dshCode, result.error.message, { sessionId: args.sessionId });
@@ -19,18 +16,18 @@ export function registerInterventionActions(server: McpServer, runtime: ActionRu
 
   registerAction(server, 'dsh.session.respond_approval', {
     description: 'Resolve one pending DSH approval with a one-shot grant or rejection.',
-    inputSchema: z.object({ sessionId, pendingInteractionId, outcome: z.enum(['allowed-once', 'rejected']) }),
-    outputSchema: z.object({ sessionId, pendingInteractionId, outcome: z.enum(['allowed-once', 'rejected']), accepted: z.literal(true) }),
+    inputSchema: z.object({ sessionId: idSchema, pendingInteractionId: idSchema, outcome: z.enum(['allowed-once', 'rejected']) }),
+    outputSchema: z.object({ sessionId: idSchema, pendingInteractionId: idSchema, outcome: z.enum(['allowed-once', 'rejected']), accepted: z.literal(true) }),
   }, (args, ctx) => respond(runtime, args.sessionId, args.pendingInteractionId, 'approval', args.outcome, requestSignal(ctx)));
 
   registerAction(server, 'dsh.session.answer_question', {
     description: 'Answer one pending DSH question batch by its interaction identity.',
     inputSchema: z.object({
-      sessionId,
-      pendingInteractionId,
+      sessionId: idSchema,
+      pendingInteractionId: idSchema,
       answers: z.array(z.object({ id: z.string().min(1), selected: z.array(z.string()), custom: z.string().optional() })).min(1),
     }),
-    outputSchema: z.object({ sessionId, pendingInteractionId, accepted: z.literal(true) }),
+    outputSchema: z.object({ sessionId: idSchema, pendingInteractionId: idSchema, accepted: z.literal(true) }),
   }, (args, ctx) => respond(runtime, args.sessionId, args.pendingInteractionId, 'question', { answers: args.answers }, requestSignal(ctx)));
 }
 

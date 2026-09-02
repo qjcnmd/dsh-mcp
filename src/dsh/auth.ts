@@ -80,8 +80,7 @@ async function discoverLauncherToken(config: DshConfig): Promise<string | undefi
     const buffer = Buffer.alloc(length);
     await file.read(buffer, 0, length, size - length);
     return latestTokenForOrigin(buffer.toString('utf8'), config.baseUrl.origin);
-  } catch (error) {
-    if (isRecordWithCode(error) && error.code === 'ENOENT') return undefined;
+  } catch {
     return undefined;
   } finally {
     await file?.close().catch(() => undefined);
@@ -102,8 +101,4 @@ function latestTokenForOrigin(logTail: string, origin: string): string | undefin
     }
   }
   return undefined;
-}
-
-function isRecordWithCode(value: unknown): value is { code: string } {
-  return typeof value === 'object' && value !== null && 'code' in value && typeof value.code === 'string';
 }

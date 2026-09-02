@@ -2,16 +2,13 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
 import { workspacePage } from '../../domain/collections.js';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
-
-const sessionId = z.string().trim().min(1);
-const workspaceSummary = z.object({ workspaceId: sessionId, title: z.string(), path: z.string(), sessionCount: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string() });
+import { idSchema as sessionId, projectToolResult, registerAction, requestSignal, toolExecutionError, workspaceSummarySchema } from './common.js';
 
 export function registerWorkspaceActions(server: McpServer, runtime: ActionRuntime): void {
   registerAction(server, 'dsh.workspace.list', {
     description: 'List compact DSH workspace summaries in deterministic pages.',
     inputSchema: z.object({ query: z.string().optional(), limit: z.number().int().min(1).max(100).default(20), cursor: z.string().min(1).optional() }),
-    outputSchema: z.object({ items: z.array(workspaceSummary), hasMore: z.boolean(), nextCursor: z.string().nullable() }),
+    outputSchema: z.object({ items: z.array(workspaceSummarySchema), hasMore: z.boolean(), nextCursor: z.string().nullable() }),
   }, async (_args, ctx) => {
     const result = await runtime.events.workspaceSnapshot(requestSignal(ctx));
     const page = workspacePage(result, _args);

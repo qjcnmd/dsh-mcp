@@ -1,26 +1,24 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio, type StdioServerHandle } from '@modelcontextprotocol/server/stdio';
-import { loadConfig, type DshConfig } from '../config.js';
+import { loadConfig } from '../config.js';
 import { DshEventClient } from '../dsh/event-client.js';
 import { DshRpcClient } from '../dsh/rpc-client.js';
 import { DshAuthSession } from '../dsh/auth.js';
 import { TurnStore } from '../domain/turns.js';
 import { PendingInteractionStore } from '../domain/pending-interactions.js';
-import { PageContextStore } from '../domain/page-context.js';
 import { registerTools } from './register-tools.js';
 
 export interface DshRuntime {
-  config: DshConfig;
   rpc: DshRpcClient;
   events: DshEventClient;
   turns: TurnStore;
   pending: PendingInteractionStore;
-  page: PageContextStore;
+  selectedSessionId: string | null;
 }
 
 export function createRuntime(config = loadConfig()): DshRuntime {
   const auth = new DshAuthSession(config);
-  return { config, rpc: new DshRpcClient(config, auth), events: new DshEventClient(config, auth), turns: new TurnStore(), pending: new PendingInteractionStore(), page: new PageContextStore() };
+  return { rpc: new DshRpcClient(config, auth), events: new DshEventClient(config, auth), turns: new TurnStore(), pending: new PendingInteractionStore(), selectedSessionId: null };
 }
 
 export function createMcpServer(runtime: DshRuntime): McpServer {

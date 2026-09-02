@@ -45,9 +45,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') {
     throw new Error('DSH_BASE_URL must use http or https');
   }
+  const authToken = envToken ?? urlToken;
   return {
-    baseUrl: new URL(baseUrl.toString().endsWith('/') ? baseUrl.toString() : `${baseUrl.toString()}/`),
-    ...((envToken ?? urlToken) === undefined || (envToken ?? urlToken) === '' ? {} : { authToken: envToken ?? urlToken }),
+    baseUrl,
+    ...(authToken === undefined || authToken === '' ? {} : { authToken }),
     requestTimeoutMs: boundedInteger('DSH_REQUEST_TIMEOUT_MS', env.DSH_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs, 100, 300_000),
     streamConnectTimeoutMs: boundedInteger('DSH_STREAM_CONNECT_TIMEOUT_MS', env.DSH_STREAM_CONNECT_TIMEOUT_MS, DEFAULTS.streamConnectTimeoutMs, 100, 120_000),
     logLevel: logLevel(env.DSH_MCP_LOG_LEVEL),

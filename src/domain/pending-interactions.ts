@@ -1,5 +1,3 @@
-export type PendingInteractionKind = 'question' | 'approval';
-
 export interface QuestionOption {
   label: string;
   description?: string;
@@ -12,18 +10,16 @@ export interface PendingQuestion {
   header?: string;
   options: QuestionOption[];
   multiSelect: boolean;
-  intent?: { kind: 'plan-review'; approve: string };
 }
 
 export interface PendingInteraction {
   pendingInteractionId: string;
   sessionId: string;
   turnRef: string | null;
-  kind: PendingInteractionKind;
+  kind: 'question' | 'approval';
   prompt: string;
   options: QuestionOption[];
   questions?: PendingQuestion[];
-  expiresAt: string | null;
 }
 
 export function publicPendingInteraction(value: PendingInteraction): Record<string, unknown> {
@@ -34,9 +30,8 @@ export function publicPendingInteraction(value: PendingInteraction): Record<stri
 export class PendingInteractionStore {
   private readonly records = new Map<string, PendingInteraction>();
 
-  upsert(record: PendingInteraction): PendingInteraction {
+  upsert(record: PendingInteraction): void {
     this.records.set(record.pendingInteractionId, structuredClone(record));
-    return this.get(record.pendingInteractionId)!;
   }
 
   get(id: string): PendingInteraction | undefined {

@@ -4,7 +4,6 @@ export const TURN_STATES = [
 ] as const;
 export type TurnState = (typeof TURN_STATES)[number];
 export type TerminalTurnState = Extract<TurnState, 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'transport-lost' | 'unknown'>;
-export type TurnEvidence = 'event' | 'history' | 'rpc' | 'recovered' | 'incomplete';
 
 export interface TerminalReason {
   kind: string;
@@ -20,12 +19,10 @@ export interface TurnProjection {
   finalAnswer: string | null;
   pendingInteractionId: string | null;
   observedAt: string;
-  evidence: TurnEvidence;
 }
 
 export interface TurnRecord extends TurnProjection {
   sourceRef: string;
-  submittedAt: string;
 }
 
 export function isTerminalState(state: TurnState): state is TerminalTurnState {
@@ -38,10 +35,10 @@ export class TurnStore {
   private readonly records = new Map<string, TurnRecord>();
   private readonly openDshTurns = new Map<string, number>();
 
-  register(input: { sessionId: string; sourceRef: string; turnRef?: string; submittedAt?: string }): TurnRecord {
-    const submittedAt = input.submittedAt ?? new Date().toISOString();
+  register(input: { sessionId: string; sourceRef: string; turnRef?: string }): TurnRecord {
+    const observedAt = new Date().toISOString();
     const turnRef = input.turnRef ?? `turn_${crypto.randomUUID()}`;
-    const record: TurnRecord = { turnRef, sessionId: input.sessionId, sourceRef: input.sourceRef, submittedAt, state: 'accepted', reason: null, finalAnswer: null, pendingInteractionId: null, observedAt: submittedAt, evidence: 'rpc' };
+    const record: TurnRecord = { turnRef, sessionId: input.sessionId, sourceRef: input.sourceRef, state: 'accepted', reason: null, finalAnswer: null, pendingInteractionId: null, observedAt };
     this.records.set(turnRef, record);
     return { ...record };
   }
@@ -53,13 +50,6 @@ export class TurnStore {
 
   all(): TurnRecord[] {
     return [...this.records.values()].map((record) => ({ ...record }));
-  }
-
-  findPendingForSession(sessionId: string): TurnRecord | undefined {
-    for (const record of this.records.values()) {
-      if (record.sessionId === sessionId && !isTerminalState(record.state) && record.sourceRef.startsWith('local-')) return { ...record };
-    }
-    return undefined;
   }
 
   bindSource(turnRef: string, sourceRef: string): TurnRecord {
@@ -88,18 +78,18 @@ export class TurnStore {
   }
 
   reject(turnRef: string, reason: string): TurnRecord {
-    return this.transition(turnRef, { state: 'failed', reason: { kind: 'rejected', code: null, message: reason }, finalAnswer: null, pendingInteractionId: null, evidence: 'rpc' });
+    return this.transition(turnRef, { state: 'failed', reason: { kind: 'rejected', code: null, message: reason }, finalAnswer: null, pendingInteractionId: null });
   }
 
   resolveInteraction(pendingInteractionId: string): TurnRecord | undefined {
     const current = [...this.records.values()].find((record) => record.state === 'pending-human-input' && record.pendingInteractionId === pendingInteractionId);
     if (current === undefined) return undefined;
-    const updated: TurnRecord = { ...current, state: 'running', reason: null, pendingInteractionId: null, observedAt: new Date().toISOString(), evidence: 'event' };
+    const updated: TurnRecord = { ...current, state: 'running', reason: null, pendingInteractionId: null, observedAt: new Date().toISOString() };
     this.records.set(updated.turnRef, updated);
     return { ...updated };
   }
 
-  transition(turnRef: string, next: Pick<TurnProjection, 'state' | 'reason' | 'finalAnswer' | 'pendingInteractionId' | 'evidence'>): TurnRecord {
+  transition(turnRef: string, next: Pick<TurnProjection, 'state' | 'reason' | 'finalAnswer' | 'pendingInteractionId'>): TurnRecord {
     const current = this.records.get(turnRef);
     if (current === undefined) throw new Error(`unknown turnRef: ${turnRef}`);
     if (isTerminalState(current.state)) return { ...current };

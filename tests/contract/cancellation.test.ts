@@ -34,15 +34,15 @@ describe('observation cancellation', () => {
       rpc: {}, events: { subscribeSession: (_sessionId: string, next: (event: DshEvent) => void) => { listener = next; return () => undefined; } },
     } as never;
     const record = turns.register({ sessionId: 'session-test', sourceRef: 'dsh-turn:1' });
-    pending.upsert({ pendingInteractionId: 'question', sessionId: 'session-test', turnRef: record.turnRef, kind: 'question', prompt: 'Continue?', options: [], questions: [{ id: 'q', question: 'Continue?', options: [], multiSelect: false }], expiresAt: null });
-    turns.transition(record.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'question', evidence: 'event' });
+    pending.upsert({ pendingInteractionId: 'question', sessionId: 'session-test', turnRef: record.turnRef, kind: 'question', prompt: 'Continue?', options: [], questions: [{ id: 'q', question: 'Continue?', options: [], multiSelect: false }] });
+    turns.transition(record.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'question' });
     expect((await waitForTurn(runtime, record.turnRef, 100, new AbortController().signal)).structuredContent).toMatchObject({ state: 'input_required' });
 
     turns.resolveInteraction('question');
     pending.remove('question');
     const resumed = waitForTurn(runtime, record.turnRef, 100, new AbortController().signal);
-    listener!({ stream: 'mux', rpcId: '', method: 'session/follow', order: 1, receivedAt: new Date().toISOString(), payload: { type: 'session/event', sessionId: 'session-test', event: { type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, message: { content: [{ type: 'text', text: 'finished' }] } } } } });
-    listener!({ stream: 'mux', rpcId: '', method: 'session/follow', order: 2, receivedAt: new Date().toISOString(), payload: { type: 'session/event', sessionId: 'session-test', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } } });
+    listener!({ stream: 'mux', rpcId: '', method: 'session/follow', payload: { type: 'session/event', sessionId: 'session-test', event: { type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, message: { content: [{ type: 'text', text: 'finished' }] } } } } });
+    listener!({ stream: 'mux', rpcId: '', method: 'session/follow', payload: { type: 'session/event', sessionId: 'session-test', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } } });
     expect(await resumed).toMatchObject({ structuredContent: { state: 'completed', turnRef: record.turnRef }, content: [{ type: 'text', text: 'finished' }] });
   });
 });

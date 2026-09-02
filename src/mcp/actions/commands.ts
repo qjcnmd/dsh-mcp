@@ -1,9 +1,7 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
-
-const sessionId = z.string().trim().min(1);
+import { idSchema as sessionId, projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
 
 export function registerCommandActions(server: McpServer, runtime: ActionRuntime): void {
   registerAction(server, 'dsh.session.command', {

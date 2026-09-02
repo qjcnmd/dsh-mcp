@@ -2,12 +2,8 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
 import { sessionSummary, workspaceSummary } from '../../domain/collections.js';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
+import { idSchema as id, projectToolResult, registerAction, requestSignal, sessionSummarySchema as session, toolExecutionError, workspaceSummarySchema as workspace } from './common.js';
 
-const id = z.string().trim().min(1);
-const model = z.object({ provider: z.string(), model: z.string(), reasoningEffort: z.string().nullable() });
-const session = z.object({ sessionId: id, workspaceId: id.nullable(), workspaceTitle: z.string().nullable(), title: z.string().nullable(), cwd: z.string().nullable(), status: z.enum(['running', 'idle']), blank: z.boolean(), updatedAt: z.number(), model: model.nullable(), agentPreset: z.string().nullable() });
-const workspace = z.object({ workspaceId: id, title: z.string(), path: z.string(), sessionCount: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string() });
 const context = z.object({ selectedSessionId: id.nullable(), session: session.nullable(), workspace: workspace.nullable() });
 
 export function registerPageActions(server: McpServer, runtime: ActionRuntime): void {
@@ -20,7 +16,7 @@ export function registerPageActions(server: McpServer, runtime: ActionRuntime): 
     const [sessions, workspaces] = await Promise.all([runtime.rpc.session.list({}, signal), runtime.events.workspaceSnapshot(signal)]);
     if (!sessions.ok) return toolExecutionError(sessions.error.dshCode, sessions.error.message, { sessionId: args.sessionId });
     if (workspaces.archivedSessionIds.includes(args.sessionId) || !sessions.value.items.some((item) => item.sessionId === args.sessionId)) return toolExecutionError('session-not-found', 'The requested session is not visible.', { sessionId: args.sessionId });
-    runtime.page.selectSession(args.sessionId);
+    runtime.selectedSessionId = args.sessionId;
     return projectToolResult({ selectedSessionId: args.sessionId }, `Selected session ${args.sessionId}.`);
   });
 
@@ -29,7 +25,7 @@ export function registerPageActions(server: McpServer, runtime: ActionRuntime): 
     inputSchema: z.object({}),
     outputSchema: context,
   }, async (_args, ctx) => {
-    const selectedSessionId = runtime.page.selectedSessionId();
+    const selectedSessionId = runtime.selectedSessionId;
     if (selectedSessionId === null) return projectToolResult({ selectedSessionId: null, session: null, workspace: null }, 'No session is selected.');
     const signal = requestSignal(ctx);
     const [sessions, workspaces] = await Promise.all([runtime.rpc.session.list({}, signal), runtime.events.workspaceSnapshot(signal)]);

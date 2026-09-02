@@ -27,7 +27,7 @@ describe('foundation contracts', () => {
       items: Array.from({ length: 25 }, (_, index) => ({ index })),
       longText,
       nested: { ok: true, token: 'secret-token', cookie: 'session-cookie' },
-    });
+    }, 'Projected result.');
 
     expect(result.structuredContent).toEqual({
       items: Array.from({ length: 25 }, (_, index) => ({ index })),

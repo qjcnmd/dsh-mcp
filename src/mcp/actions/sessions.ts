@@ -4,20 +4,15 @@ import { sessionPage } from '../../domain/collections.js';
 import { terminalFromReason, visibleAssistantText } from '../../dsh/recovery.js';
 import { DshMcpError } from '../../errors.js';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
+import { idSchema as sessionId, projectToolResult, reasonSchema, registerAction, requestSignal, sessionSummarySchema, toolExecutionError } from './common.js';
 
-const sessionId = z.string().trim().min(1);
-const workspaceId = z.string().trim().min(1);
-const modelSelection = z.object({ provider: z.string(), model: z.string(), reasoningEffort: z.string().nullable() });
-const sessionSummary = z.object({ sessionId, workspaceId: workspaceId.nullable(), workspaceTitle: z.string().nullable(), title: z.string().nullable(), cwd: z.string().nullable(), status: z.enum(['running', 'idle']), blank: z.boolean(), updatedAt: z.number(), model: modelSelection.nullable(), agentPreset: z.string().nullable() });
-const reason = z.object({ kind: z.string(), code: z.string().nullable(), message: z.string().nullable() });
-const historyTurn = z.object({ turn: z.number().int().nonnegative(), state: z.enum(['running', 'completed', 'failed', 'cancelled', 'interrupted', 'unknown']), startedAt: z.number().nullable(), endedAt: z.number().nullable(), userMessages: z.array(z.object({ text: z.string().nullable(), imageCount: z.number().int().nonnegative() })), finalResponse: z.string().nullable(), finalResponseComplete: z.boolean(), reason: reason.nullable() });
+const historyTurn = z.object({ turn: z.number().int().nonnegative(), state: z.enum(['running', 'completed', 'failed', 'cancelled', 'interrupted', 'unknown']), startedAt: z.number().nullable(), endedAt: z.number().nullable(), userMessages: z.array(z.object({ text: z.string().nullable(), imageCount: z.number().int().nonnegative() })), finalResponse: z.string().nullable(), finalResponseComplete: z.boolean(), reason: reasonSchema.nullable() });
 
 export function registerSessionActions(server: McpServer, runtime: ActionRuntime): void {
   registerAction(server, 'dsh.session.list', {
     description: 'List compact unarchived DSH session summaries with AND-composed filters.',
-    inputSchema: z.object({ workspaceId: workspaceId.optional(), status: z.enum(['running', 'idle']).optional(), query: z.string().optional(), limit: z.number().int().min(1).max(100).default(20), cursor: z.string().min(1).optional() }),
-    outputSchema: z.object({ items: z.array(sessionSummary), hasMore: z.boolean(), nextCursor: z.string().nullable() }),
+    inputSchema: z.object({ workspaceId: sessionId.optional(), status: z.enum(['running', 'idle']).optional(), query: z.string().optional(), limit: z.number().int().min(1).max(100).default(20), cursor: z.string().min(1).optional() }),
+    outputSchema: z.object({ items: z.array(sessionSummarySchema), hasMore: z.boolean(), nextCursor: z.string().nullable() }),
   }, async (args, ctx) => {
     const signal = requestSignal(ctx);
     const [sessions, workspaces] = await Promise.all([runtime.rpc.session.list({}, signal), runtime.events.workspaceSnapshot(signal)]);
@@ -29,7 +24,7 @@ export function registerSessionActions(server: McpServer, runtime: ActionRuntime
   registerAction(server, 'dsh.session.create', {
     description: 'Create a DSH session in an explicit workspace or directory.',
     inputSchema: z.object({
-      workspaceId: workspaceId.optional(),
+      workspaceId: sessionId.optional(),
       cwd: z.string().trim().min(1).optional(),
       sessionId: sessionId.optional(),
       agentPreset: z.string().trim().min(1).optional(),

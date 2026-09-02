@@ -6,17 +6,11 @@ import { publicPendingInteraction, type PendingQuestion } from '../../domain/pen
 import { classifyHistoryTurn, terminalFromReason, visibleAssistantText } from '../../dsh/recovery.js';
 import { isTerminalState, type TerminalReason, type TurnRecord } from '../../domain/turns.js';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
+import { idSchema as id, pendingInteractionSchema as pendingSchema, projectToolResult, reasonSchema, registerAction, requestSignal, toolExecutionError } from './common.js';
 
-const id = z.string().trim().min(1);
-const reasonSchema = z.object({ kind: z.string(), code: z.string().nullable(), message: z.string().nullable() });
 const contentPart = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string().min(1) }),
   z.object({ type: z.literal('image'), mediaType: z.enum(['image/png', 'image/jpeg', 'image/webp', 'image/gif']), data: z.string().min(1), name: id.optional() }),
-]);
-const pendingSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('approval'), pendingInteractionId: id, sessionId: id, prompt: z.string(), options: z.array(z.object({ outcome: z.enum(['allowed-once', 'rejected']), label: z.string() })) }),
-  z.object({ kind: z.literal('question'), pendingInteractionId: id, sessionId: id, questions: z.array(z.object({ id, question: z.string(), detail: z.string().optional(), header: z.string().optional(), options: z.array(z.object({ label: z.string(), description: z.string().optional() })), multiSelect: z.boolean() })) }),
 ]);
 const waitOutputSchema = z.discriminatedUnion('state', [
   z.object({ state: z.literal('completed'), turnRef: id, sessionId: id, hasFinalResponse: z.boolean() }),
@@ -77,7 +71,7 @@ export async function waitForTurn(runtime: ActionRuntime, ref: string, timeoutMs
         void recoverAfterDisconnect(runtime, ref, existing, signal).then((recovered) => {
           if (recovered !== null) finish(waitResult(runtime, recovered));
           else {
-            const lost = runtime.turns.transition(ref, { state: 'transport-lost', reason: { kind: 'transport-lost', code: null, message: readMessage(event.payload) }, finalAnswer: runtime.turns.get(ref)?.finalAnswer ?? null, pendingInteractionId: null, evidence: 'incomplete' });
+            const lost = runtime.turns.transition(ref, { state: 'transport-lost', reason: { kind: 'transport-lost', code: null, message: readMessage(event.payload) }, finalAnswer: runtime.turns.get(ref)?.finalAnswer ?? null, pendingInteractionId: null });
             finish(waitResult(runtime, lost));
           }
         });
@@ -95,12 +89,12 @@ export async function waitForTurn(runtime: ActionRuntime, ref: string, timeoutMs
 async function submitTurn(runtime: ActionRuntime, input: { sessionId: string; content: SessionPromptPart[]; mode: 'queue' | 'steer'; clientTimeZone?: string }, signal: AbortSignal): Promise<CallToolResult> {
   const requestId = crypto.randomUUID();
   const record = runtime.turns.register({ sessionId: input.sessionId, sourceRef: `rpc:${requestId}` });
-  const response = await runtime.rpc.session.promptWithId({ requestId, ...input }, signal);
-  if (!response.result.ok) {
-    runtime.turns.reject(record.turnRef, response.result.error.message);
-    return toolExecutionError(response.result.error.dshCode, response.result.error.message, { sessionId: input.sessionId });
+  const response = await runtime.rpc.session.prompt({ requestId, ...input }, signal);
+  if (!response.ok) {
+    runtime.turns.reject(record.turnRef, response.error.message);
+    return toolExecutionError(response.error.dshCode, response.error.message, { sessionId: input.sessionId });
   }
-  if (input.mode === 'queue') runtime.turns.transition(record.turnRef, { state: 'queued', reason: null, finalAnswer: null, pendingInteractionId: null, evidence: 'rpc' });
+  if (input.mode === 'queue') runtime.turns.transition(record.turnRef, { state: 'queued', reason: null, finalAnswer: null, pendingInteractionId: null });
   return projectToolResult({ sessionId: input.sessionId, turnRef: record.turnRef, accepted: true, mode: input.mode }, `Message accepted in ${input.mode} mode.`);
 }
 
@@ -148,11 +142,11 @@ function findMatchingTurns(runtime: ActionRuntime, frame: Record<string, unknown
   return typeof data.turn === 'number' ? runtime.turns.findByDshTurn(sessionId, data.turn) : [];
 }
 
-function stateFromEvent(event: Record<string, unknown>, previousAnswer: string | null): Pick<TurnRecord, 'state' | 'reason' | 'finalAnswer' | 'pendingInteractionId' | 'evidence'> | null {
+function stateFromEvent(event: Record<string, unknown>, previousAnswer: string | null): Pick<TurnRecord, 'state' | 'reason' | 'finalAnswer' | 'pendingInteractionId'> | null {
   const data = isRecord(event.data) ? event.data : {};
-  if (event.type === 'turn/end') return { ...terminalFromReason(data.reason), finalAnswer: previousAnswer, pendingInteractionId: null, evidence: 'event' };
-  if (event.type === 'turn/start' || event.type === 'user/message') return { state: 'running', reason: null, finalAnswer: previousAnswer, pendingInteractionId: null, evidence: 'event' };
-  if (event.type === 'assistant/message') return { state: 'running', reason: null, finalAnswer: visibleAssistantText(event) ?? previousAnswer, pendingInteractionId: null, evidence: 'event' };
+  if (event.type === 'turn/end') return { ...terminalFromReason(data.reason), finalAnswer: previousAnswer, pendingInteractionId: null };
+  if (event.type === 'turn/start' || event.type === 'user/message') return { state: 'running', reason: null, finalAnswer: previousAnswer, pendingInteractionId: null };
+  if (event.type === 'assistant/message') return { state: 'running', reason: null, finalAnswer: visibleAssistantText(event) ?? previousAnswer, pendingInteractionId: null };
   return null;
 }
 
@@ -161,8 +155,8 @@ function observeInteraction(runtime: ActionRuntime, event: DshEvent, sessionId: 
   const questions = event.method === 'user-questions/request' ? parseQuestions(request.questions) : undefined;
   const toolName = typeof request.toolName === 'string' ? request.toolName : 'tool';
   const prompt = questions?.map((question) => question.question).join('\n') || (typeof request.reason === 'string' ? `${toolName}: ${request.reason}` : `DSH requests approval for ${toolName}`);
-  runtime.pending.upsert({ pendingInteractionId: event.rpcId, sessionId, turnRef: turn?.turnRef ?? null, kind: questions === undefined ? 'approval' : 'question', prompt, options: questions === undefined ? [{ label: 'allowed-once' }, { label: 'rejected' }] : [], ...(questions === undefined ? {} : { questions }), expiresAt: null });
-  if (turn !== undefined) runtime.turns.transition(turn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: turn.finalAnswer, pendingInteractionId: event.rpcId, evidence: 'event' });
+  runtime.pending.upsert({ pendingInteractionId: event.rpcId, sessionId, turnRef: turn?.turnRef ?? null, kind: questions === undefined ? 'approval' : 'question', prompt, options: questions === undefined ? [{ label: 'allowed-once' }, { label: 'rejected' }] : [], ...(questions === undefined ? {} : { questions }) });
+  if (turn !== undefined) runtime.turns.transition(turn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: turn.finalAnswer, pendingInteractionId: event.rpcId });
 }
 
 function waitResult(runtime: ActionRuntime, record: TurnRecord, outcome?: 'timed_out'): CallToolResult {

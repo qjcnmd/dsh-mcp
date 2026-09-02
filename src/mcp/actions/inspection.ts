@@ -3,16 +3,8 @@ import type { McpServer } from '@modelcontextprotocol/server';
 import { publicPendingInteraction } from '../../domain/pending-interactions.js';
 import { sessionSummary } from '../../domain/collections.js';
 import { isTerminalState, TURN_STATES } from '../../domain/turns.js';
-import type { RuntimeSnapshot } from '../../domain/snapshots.js';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
-
-const id = z.string().trim().min(1);
-const model = z.object({ provider: z.string(), model: z.string(), reasoningEffort: z.string().nullable() });
-const summary = z.object({ sessionId: id, workspaceId: id.nullable(), workspaceTitle: z.string().nullable(), title: z.string().nullable(), cwd: z.string().nullable(), status: z.enum(['running', 'idle']), blank: z.boolean(), updatedAt: z.number(), model: model.nullable(), agentPreset: z.string().nullable() });
-const reason = z.object({ kind: z.string(), code: z.string().nullable(), message: z.string().nullable() });
-const question = z.object({ id, question: z.string(), detail: z.string().optional(), header: z.string().optional(), options: z.array(z.object({ label: z.string(), description: z.string().optional() })), multiSelect: z.boolean() });
-const pending = z.discriminatedUnion('kind', [z.object({ kind: z.literal('approval'), pendingInteractionId: id, sessionId: id, prompt: z.string(), options: z.array(z.object({ outcome: z.enum(['allowed-once', 'rejected']), label: z.string() })) }), z.object({ kind: z.literal('question'), pendingInteractionId: id, sessionId: id, questions: z.array(question) })]);
+import { idSchema as id, pendingInteractionSchema as pending, projectToolResult, reasonSchema as reason, registerAction, requestSignal, sessionSummarySchema as summary, toolExecutionError } from './common.js';
 
 export function registerInspectionActions(server: McpServer, runtime: ActionRuntime): void {
   registerAction(server, 'dsh.session.snapshot', {
@@ -33,7 +25,7 @@ export function registerInspectionActions(server: McpServer, runtime: ActionRunt
       const data = isRecord(event.data) ? event.data : {};
       return [{ seq: event.seq, type: event.type, time: typeof event.time === 'number' ? event.time : null, turn: typeof data.turn === 'number' ? data.turn : null }];
     });
-    const snapshot: RuntimeSnapshot = {
+    const snapshot = {
       session: sessionSummary(raw, workspace),
       activeTurn: active === undefined ? null : { turnRef: active.turnRef, state: active.state, reason: active.reason, observedAt: active.observedAt },
       pendingInteractions: runtime.pending.list(args.sessionId).map(publicPendingInteraction),

@@ -13,6 +13,17 @@ const errorOutputSchema = z.object({
   }),
 });
 
+export const idSchema = z.string().trim().min(1);
+export const reasonSchema = z.object({ kind: z.string(), code: z.string().nullable(), message: z.string().nullable() });
+export const modelSelectionSchema = z.object({ provider: z.string(), model: z.string(), reasoningEffort: z.string().nullable() });
+export const sessionSummarySchema = z.object({ sessionId: idSchema, workspaceId: idSchema.nullable(), workspaceTitle: z.string().nullable(), title: z.string().nullable(), cwd: z.string().nullable(), status: z.enum(['running', 'idle']), blank: z.boolean(), updatedAt: z.number(), model: modelSelectionSchema.nullable(), agentPreset: z.string().nullable() });
+export const workspaceSummarySchema = z.object({ workspaceId: idSchema, title: z.string(), path: z.string(), sessionCount: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string() });
+export const questionSchema = z.object({ id: idSchema, question: z.string(), detail: z.string().optional(), header: z.string().optional(), options: z.array(z.object({ label: z.string(), description: z.string().optional() })), multiSelect: z.boolean() });
+export const pendingInteractionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('approval'), pendingInteractionId: idSchema, sessionId: idSchema, prompt: z.string(), options: z.array(z.object({ outcome: z.enum(['allowed-once', 'rejected']), label: z.string() })) }),
+  z.object({ kind: z.literal('question'), pendingInteractionId: idSchema, sessionId: idSchema, questions: z.array(questionSchema) }),
+]);
+
 export function requestSignal(ctx: ServerContext): AbortSignal {
   return ctx.mcpReq.signal;
 }

@@ -1,11 +1,9 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
-import type { DshSessionSummary } from '../../dsh/rpc-client.js';
+import { sessionSummary } from '../../domain/collections.js';
 import type { ActionRuntime } from './common.js';
-import { projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
+import { idSchema as sessionId, modelSelectionSchema as selectionSchema, projectToolResult, registerAction, requestSignal, toolExecutionError } from './common.js';
 
-const sessionId = z.string().trim().min(1);
-const selectionSchema = z.object({ provider: z.string(), model: z.string(), reasoningEffort: z.string().nullable() });
 const modelSchema = z.object({ provider: z.string(), model: z.string(), label: z.string().nullable(), reasoningEfforts: z.array(z.string()) });
 
 export function registerModelActions(server: McpServer, runtime: ActionRuntime): void {
@@ -23,7 +21,7 @@ export function registerModelActions(server: McpServer, runtime: ActionRuntime):
     if (!sessions.ok) return toolExecutionError(sessions.error.dshCode, sessions.error.message, { sessionId: args.sessionId });
     const session = sessions.value.items.find((item) => item.sessionId === args.sessionId);
     if (session === undefined) return toolExecutionError('session-not-found', 'The requested session is not visible.', { sessionId: args.sessionId });
-    const selection = readModelSelection(session);
+    const selection = sessionSummary(session).model;
     const routable = new Set(catalog.value.routableProviders);
     const models = catalog.value.groups.filter((group) => typeof group.id === 'string' && routable.has(group.id)).flatMap((group) => {
       if (typeof group.id !== 'string' || !Array.isArray(group.models)) return [];
@@ -47,13 +45,6 @@ export function registerModelActions(server: McpServer, runtime: ActionRuntime):
     const selected = result.value.selected;
     return projectToolResult({ sessionId: args.sessionId, selected: { provider: selected.provider, model: selected.model, reasoningEffort: selected.reasoningEffort ?? null } }, `Selected ${selected.provider}/${selected.model}.`);
   });
-}
-
-function readModelSelection(session: DshSessionSummary) {
-  const projection = session.projections?.values.modelSelection;
-  if (!isRecord(projection)) return null;
-  const value = isRecord(projection.next) ? projection.next : isRecord(projection.lastUsed) ? projection.lastUsed : undefined;
-  return value !== undefined && typeof value.provider === 'string' && typeof value.model === 'string' ? { provider: value.provider, model: value.model, reasoningEffort: typeof value.reasoningEffort === 'string' ? value.reasoningEffort : null } : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

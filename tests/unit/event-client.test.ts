@@ -59,7 +59,6 @@ describe('DSH Remote stream client', () => {
     expect(opens.map((open) => open.endpoint)).toEqual(expect.arrayContaining(['workspace/follow', 'session/follow', '$events']));
 
     unsubscribe();
-    await client.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });
