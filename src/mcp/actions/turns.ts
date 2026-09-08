@@ -46,6 +46,8 @@ export async function waitForTurn(runtime: ActionRuntime, ref: string, timeoutMs
   if (isTerminalState(existing.state) || existing.state === 'pending-human-input') return waitResult(runtime, existing);
 
   return new Promise<CallToolResult>((resolve, reject) => {
+    const recovery = new AbortController();
+    const recoverySignal = AbortSignal.any([signal, recovery.signal]);
     let settled = false;
     let recovering = false;
     let unsubscribe = (): void => undefined;
@@ -54,6 +56,7 @@ export async function waitForTurn(runtime: ActionRuntime, ref: string, timeoutMs
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      recovery.abort();
       unsubscribe();
       signal.removeEventListener('abort', abort);
       if (error !== undefined) reject(error);
@@ -66,9 +69,11 @@ export async function waitForTurn(runtime: ActionRuntime, ref: string, timeoutMs
 
     unsubscribe = runtime.events.subscribeSession(existing.sessionId, (event) => {
       observeEvent(runtime, event);
-      if (event.method === 'stream/error' && event.stream === 'mux' && !recovering) {
+      if (settled) return;
+      if (event.method === 'stream/error' && !recovering) {
         recovering = true;
-        void recoverAfterDisconnect(runtime, ref, existing, signal).then((recovered) => {
+        void recoverAfterDisconnect(runtime, ref, runtime.turns.get(ref) ?? existing, recoverySignal).then((recovered) => {
+          if (settled) return;
           if (recovered !== null) finish(waitResult(runtime, recovered));
           else {
             const lost = runtime.turns.transition(ref, { state: 'transport-lost', reason: { kind: 'transport-lost', code: null, message: readMessage(event.payload) }, finalAnswer: runtime.turns.get(ref)?.finalAnswer ?? null, pendingInteractionId: null });
@@ -102,6 +107,13 @@ export function observeEvent(runtime: ActionRuntime, event: DshEvent): void {
   const frame = unwrapEvent(event.payload);
   if (!isRecord(frame)) return;
   const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : undefined;
+  if (event.method === 'stream/error' && event.stream === 'host' && sessionId !== undefined) {
+    for (const pending of runtime.pending.list(sessionId)) {
+      if (pending.turnRef !== null) runtime.turns.transition(pending.turnRef, { state: 'transport-lost', reason: { kind: 'transport-lost', code: null, message: readMessage(event.payload) }, finalAnswer: runtime.turns.get(pending.turnRef)?.finalAnswer ?? null, pendingInteractionId: null });
+      runtime.pending.remove(pending.pendingInteractionId);
+    }
+    return;
+  }
   const request = isRecord(frame.request) ? frame.request : undefined;
   if ((event.method === 'approval/request' || event.method === 'user-questions/request') && sessionId !== undefined && request !== undefined) {
     observeInteraction(runtime, event, sessionId, request);
@@ -122,7 +134,7 @@ export function observeEvent(runtime: ActionRuntime, event: DshEvent): void {
 async function recoverAfterDisconnect(runtime: ActionRuntime, ref: string, record: TurnRecord, signal: AbortSignal): Promise<TurnRecord | null> {
   if (signal.aborted) return null;
   const snapshot = await runtime.events.sessionSnapshot(record.sessionId, 200, signal).catch(() => null);
-  if (snapshot === null) return null;
+  if (snapshot === null || signal.aborted) return null;
   const projection = classifyHistoryTurn({ records: snapshot.records, hasMore: snapshot.hasMore }, ref, record.sessionId, record.sourceRef);
   return projection === null ? null : runtime.turns.transition(ref, projection);
 }

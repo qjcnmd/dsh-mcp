@@ -1,7 +1,7 @@
+import { callMcpTool as callTool, mcpRequest } from '../unit/fixtures.js';
 import { describe, expect, it } from 'vitest';
-import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { loadConfig } from '../../src/config.js';
-import { createMcpServer, createRuntime } from '../../src/mcp/transport.js';
+import { createRuntime } from '../../src/mcp/transport.js';
 import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
 
@@ -191,21 +191,8 @@ describe('public tool surface', () => {
 });
 
 async function listTools(): Promise<Array<Record<string, unknown>>> {
-  const server = createMcpServer(createRuntime(loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' })));
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const messages: unknown[] = [];
-  clientTransport.onmessage = (message) => messages.push(message);
-  await server.connect(serverTransport);
-  await clientTransport.start();
-  await clientTransport.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'coverage', version: '1' } } });
-  await clientTransport.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-  await clientTransport.send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const response = messages.find((message) => isRecord(message) && message.id === 2);
-  await clientTransport.close();
-  await server.close();
-  const tools = isRecord(response) && isRecord(response.result) && Array.isArray(response.result.tools) ? response.result.tools : [];
-  return tools.filter(isRecord);
+  const result = await mcpRequest(createRuntime(loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' })), 'tools/list', {});
+  return Array.isArray(result.tools) ? result.tools.filter(isRecord) : [];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -220,21 +207,4 @@ function collectionRuntime(sessions: unknown[], workspaces: unknown) {
     pending: new PendingInteractionStore(),
     selectedSessionId: null,
   } as never;
-}
-
-async function callTool(runtime: Parameters<typeof createMcpServer>[0], name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const server = createMcpServer(runtime);
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const messages: Record<string, unknown>[] = [];
-  clientTransport.onmessage = (message) => messages.push(message as Record<string, unknown>);
-  await server.connect(serverTransport);
-  await clientTransport.start();
-  await clientTransport.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'coverage', version: '1' } } });
-  await clientTransport.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-  await clientTransport.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const result = messages.find((message) => message.id === 2)?.result as Record<string, unknown>;
-  await clientTransport.close();
-  await server.close();
-  return result;
 }

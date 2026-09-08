@@ -1,10 +1,9 @@
+import { callMcpTool } from '../unit/fixtures.js';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config.js';
 import { DshRpcClient } from '../../src/dsh/rpc-client.js';
-import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
-import { createMcpServer } from '../../src/mcp/transport.js';
 import { jsonResponse } from '../unit/fixtures.js';
 
 const config = loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' });
@@ -121,19 +120,6 @@ describe('current DSH RPC wire contract', () => {
   });
 });
 
-async function callTool(runtime: Parameters<typeof createMcpServer>[0], args: Record<string, unknown>, name = 'dsh.session.send_message'): Promise<Record<string, unknown>> {
-  const server = createMcpServer(runtime);
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const messages: Record<string, unknown>[] = [];
-  clientTransport.onmessage = (message) => messages.push(message as Record<string, unknown>);
-  await server.connect(serverTransport);
-  await clientTransport.start();
-  await clientTransport.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'wire', version: '1' } } });
-  await clientTransport.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-  await clientTransport.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const response = messages.find((message) => message.id === 2);
-  await clientTransport.close();
-  await server.close();
-  return response?.result as Record<string, unknown>;
+function callTool(runtime: Parameters<typeof callMcpTool>[0], args: Record<string, unknown>, name = 'dsh.session.send_message') {
+  return callMcpTool(runtime, name, args);
 }

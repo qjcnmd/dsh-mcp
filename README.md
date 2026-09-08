@@ -25,6 +25,10 @@ The server is intentionally small. It exposes exactly these 19 tools:
 - DSH connections are opened only for an explicit tool call or an active turn wait.
 - List and history results are paged. Final responses are returned once, without
   truncation, and results omit credentials, raw envelopes, and unrequested traces.
+- Pending approvals and questions retain their event listener until answered, withdrawn,
+  or disconnected, even after the wait returns.
+- One-shot snapshot reads use `DSH_REQUEST_TIMEOUT_MS`, including the opening baseline;
+  long-lived turn waits use their own deadline.
 - The context tools keep a read context inside the MCP process. They do not control a browser page.
 - `turnRef` values belong to the running MCP process. Send and wait for a turn through
   the same process.

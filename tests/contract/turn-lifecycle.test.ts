@@ -1,11 +1,10 @@
+import { callMcpTool } from '../unit/fixtures.js';
 import { describe, expect, it } from 'vitest';
-import { InMemoryTransport } from '@modelcontextprotocol/server';
 import type { DshEvent as Event } from '../../src/dsh/event-client.js';
 import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
 import { classifyHistoryTurn } from '../../src/dsh/recovery.js';
 import { observeEvent, waitForTurn } from '../../src/mcp/actions/turns.js';
-import { createMcpServer } from '../../src/mcp/transport.js';
 
 describe('turn lifecycle projection', () => {
   it('correlates DSH turn numbers and preserves the final assistant answer', () => {
@@ -192,21 +191,4 @@ function historyEvent(type: string, data: Record<string, unknown>, surfaceOp?: '
 
 function record(seq: number, type: string, data: Record<string, unknown>, surfaceOp?: 'append') {
   return { type: 'event' as const, event: { seq, time: seq * 10, type, data, ...(surfaceOp === undefined ? {} : { surfaceOp }) } };
-}
-
-async function callMcpTool(runtime: Parameters<typeof createMcpServer>[0], name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const server = createMcpServer(runtime);
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const messages: Record<string, unknown>[] = [];
-  clientTransport.onmessage = (message) => messages.push(message as Record<string, unknown>);
-  await server.connect(serverTransport);
-  await clientTransport.start();
-  await clientTransport.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'turns', version: '1' } } });
-  await clientTransport.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-  await clientTransport.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const result = messages.find((message) => message.id === 2)?.result as Record<string, unknown>;
-  await clientTransport.close();
-  await server.close();
-  return result;
 }

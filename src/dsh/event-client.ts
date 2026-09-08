@@ -125,9 +125,17 @@ export class DshEventClient {
 
   subscribeSession(sessionId: string, listener: DshEventListener, signal?: AbortSignal): () => void {
     const controller = new AbortController();
+    let stopped = false;
+    // Pending interactions outlive a wait call and still need cancellation/failure events.
+    const detach = () => {
+      if (stopped && ![...this.remoteInteractions.values()].some((ref) => ref.sessionId === sessionId)) this.listeners.delete(forward);
+    };
     const forward: DshEventListener = (event) => {
       const payload = isRecord(event.payload) ? event.payload : undefined;
-      if (payload?.sessionId === sessionId) listener(event);
+      if (payload?.sessionId === sessionId) {
+        listener(event);
+        detach();
+      }
     };
     this.listeners.add(forward);
     this.retainRemoteEvents(sessionId);
@@ -140,13 +148,13 @@ export class DshEventClient {
       if (!controller.signal.aborted) this.emitStreamError('mux', 'session/follow', error, sessionId);
     });
 
-    let stopped = false;
     const stop = () => {
       if (stopped) return;
       stopped = true;
       controller.abort();
-      this.listeners.delete(forward);
+      signal?.removeEventListener('abort', stop);
       this.releaseRemoteEvents(sessionId);
+      detach();
     };
     if (signal !== undefined) {
       if (signal.aborted) stop();
@@ -161,16 +169,14 @@ export class DshEventClient {
       return { ok: false, error: new DshDomainError('pending-interaction-not-found', 'The pending interaction is no longer available.', { eventId }) };
     }
     const result = await this.rpc.remoteEvents.result({ clientId: ref.clientId, eventId: ref.eventId, outcome: { kind: 'result', value } }, signal);
-    if (result.ok) {
-      this.remoteInteractions.delete(eventId);
-      this.maybeStopRemoteEvents();
-    }
+    if (result.ok) this.resolveRemoteInteraction(eventId);
     return result;
   }
 
   private async firstFrame(endpoint: string, payload: Record<string, unknown>, accepts: (value: unknown) => boolean, signal?: AbortSignal): Promise<unknown> {
     const controller = new AbortController();
     const combined = signal === undefined ? controller.signal : AbortSignal.any([controller.signal, signal]);
+    const timer = setTimeout(() => controller.abort(new DshTransportError(`DSH ${endpoint} opening baseline timed out`, null, { endpoint })), this.config.requestTimeoutMs);
     return new Promise<unknown>((resolve, reject) => {
       let settled = false;
       void this.runLogicalStream(endpoint, payload, (value) => {
@@ -179,11 +185,11 @@ export class DshEventClient {
         resolve(value);
         controller.abort();
       }, combined).then(() => {
-        if (!settled) reject(new DshProtocolError(`DSH ${endpoint} ended before its opening baseline`));
+        if (!settled) reject(combined.aborted ? combined.reason : new DshProtocolError(`DSH ${endpoint} ended before its opening baseline`));
       }, (error: unknown) => {
         if (!settled) reject(error);
       });
-    });
+    }).finally(() => { clearTimeout(timer); controller.abort(); });
   }
 
   private retainRemoteEvents(sessionId: string): void {
@@ -191,8 +197,13 @@ export class DshEventClient {
     if (this.remoteController !== undefined) return;
     const controller = new AbortController();
     this.remoteController = controller;
-    void this.runLogicalStream('$events', { args: {} }, (value) => this.handleRemoteEvent(value), controller.signal).catch((error) => {
-      if (!controller.signal.aborted) this.emitStreamError('host', '$events', error);
+    void this.runLogicalStream('$events', { args: {} }, (value) => this.handleRemoteEvent(value), controller.signal).then(() => {
+      if (!controller.signal.aborted) throw new DshTransportError('DSH remote events ended unexpectedly');
+    }).catch((error) => {
+      if (controller.signal.aborted) return;
+      const sessions = new Set([...this.remoteSessionRefs.keys(), ...[...this.remoteInteractions.values()].map((ref) => ref.sessionId)]);
+      this.remoteInteractions.clear();
+      for (const sessionId of sessions) this.emitStreamError('host', '$events', error, sessionId);
     }).finally(() => {
       if (this.remoteController === controller) {
         this.remoteController = undefined;
@@ -214,6 +225,13 @@ export class DshEventClient {
     this.remoteController = undefined;
   }
 
+  private resolveRemoteInteraction(eventId: string): void {
+    const ref = this.remoteInteractions.get(eventId);
+    this.remoteInteractions.delete(eventId);
+    if (ref !== undefined) this.emit({ stream: 'host', rpcId: eventId, method: 'remote/cancel', payload: { sessionId: ref.sessionId } });
+    this.maybeStopRemoteEvents();
+  }
+
   private handleRemoteEvent(value: unknown): void {
     if (!isRecord(value)) return;
     if (value.type === 'ready' && typeof value.clientId === 'string') {
@@ -221,10 +239,7 @@ export class DshEventClient {
       return;
     }
     if (value.type === 'cancel' && typeof value.eventId === 'string') {
-      const ref = this.remoteInteractions.get(value.eventId);
-      this.remoteInteractions.delete(value.eventId);
-      if (ref !== undefined) this.emit({ stream: 'host', rpcId: value.eventId, method: 'remote/cancel', payload: { sessionId: ref.sessionId } });
-      this.maybeStopRemoteEvents();
+      this.resolveRemoteInteraction(value.eventId);
       return;
     }
     if (value.type !== 'waterfall'
