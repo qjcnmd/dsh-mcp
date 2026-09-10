@@ -1,15 +1,15 @@
-import { callMcpTool } from '../unit/fixtures.js';
+import { callMcpTool, testRuntime, followSnapshot } from '../unit/fixtures.js';
+import { DshDomainError, DshTransportError } from '../../src/errors.js';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config.js';
 import { DshRpcClient } from '../../src/dsh/rpc-client.js';
-import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
 import { jsonResponse } from '../unit/fixtures.js';
 
 const config = loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' });
 
 describe('current DSH RPC wire contract', () => {
-  it('executes slash commands through commands/execute', async () => {
+  it('sets full access through the native permission command', async () => {
     let url = '';
     let body: Record<string, unknown> = {};
     const client = new DshRpcClient(config, async (input, init) => {
@@ -22,14 +22,13 @@ describe('current DSH RPC wire contract', () => {
       });
     });
 
-    const result = await client.commands.execute({ sessionId: 'session-test', line: '/compact now' });
+    await client.setFullAccess('session-test');
 
-    expect(result).toEqual({ ok: true, value: { commandId: 'command-1', result: { kind: 'success', text: 'done' } } });
     expect(url).toBe('http://127.0.0.1:3080/api/commands/execute');
     expect(body).toMatchObject({
       type: 'client-request',
       method: 'commands/execute',
-      payload: { args: { agentId: 'session-test', line: '/compact now', images: [] } },
+      payload: { args: { agentId: 'session-test', line: '/permission danger-full-access', submittedAttachments: [] } },
     });
   });
 
@@ -43,7 +42,6 @@ describe('current DSH RPC wire contract', () => {
     const response = await client.session.prompt({
       requestId: 'prompt-1',
       sessionId: 'session-test',
-      mode: 'queue',
       content: [{ type: 'text', text: 'hello' }],
     });
 
@@ -51,25 +49,25 @@ describe('current DSH RPC wire contract', () => {
     expect(body).toMatchObject({
       rpcId: expect.any(String),
       method: 'session/prompt',
-      payload: { args: { request: { requestId: 'prompt-1', sessionId: 'session-test', mode: 'queue', content: [{ type: 'text', text: 'hello' }] } } },
+      payload: { args: { request: { requestId: 'prompt-1', sessionId: 'session-test', mode: 'steer', content: [{ type: 'text', text: 'hello' }] } } },
     });
   });
 
-  it('sends omitted mode as steer and preserves explicit queue', async () => {
-    const modes: string[] = [];
-    const runtime = {
+  it('accepts task text and shared paths and rejects removed queue and attachment inputs', async () => {
+    const messages: unknown[] = [];
+    const runtime = testRuntime({
       turns: new TurnStore(),
-      pending: new PendingInteractionStore(),
-      selectedSessionId: null,
-      rpc: { session: { prompt: async (request: { mode: string }) => { modes.push(request.mode); return { ok: true, value: { accepted: true } }; } } },
-      events: {},
-    } as never;
-    const first = await callTool(runtime, { sessionId: 'session-test', message: 'first' });
-    const second = await callTool(runtime, { sessionId: 'session-test', message: 'second', mode: 'queue' });
-
-    expect(modes).toEqual(['steer', 'queue']);
-    expect(first.structuredContent).toMatchObject({ accepted: true, mode: 'steer' });
-    expect(second.structuredContent).toMatchObject({ accepted: true, mode: 'queue' });
+      rpc: { session: { prompt: async (request) => { messages.push(request.content); return { ok: true, value: { accepted: true } }; } } },
+      events: { sessionSnapshot: async () => followSnapshot() },
+    });
+    const message = 'Review ./src/example.ts and report the result.';
+    const first = await callTool(runtime, { sessionId: 'session-test', message });
+    expect(first.structuredContent).toMatchObject({ accepted: true });
+    for (const args of [
+      { message: 'second', mode: 'queue' },
+      { content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] },
+    ]) expect(await callTool(runtime, { sessionId: 'session-test', ...args })).toMatchObject({ isError: true });
+    expect(messages).toEqual([[{ type: 'text', text: message }]]);
   });
 
   it('returns the complete current session list without native continuation metadata', async () => {
@@ -80,43 +78,45 @@ describe('current DSH RPC wire contract', () => {
       return jsonResponse({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: { items } } });
     });
 
-    const result = await client.session.list({ cursor: 'ignored-by-current-dsh' });
+    const result = await client.session.list();
     expect(result).toEqual({ ok: true, value: { items } });
-    expect(body).toMatchObject({ method: 'session/list', payload: { args: { _request: { cursor: 'ignored-by-current-dsh' } } } });
+    expect(body).toMatchObject({ method: 'session/list', payload: { args: { _request: {} } } });
     expect(result.ok && Object.keys(result.value)).toEqual(['items']);
   });
 
-  it('uses current wires for model selection, cancellation, and archive membership', async () => {
+  it('uses current wires for model selection, cancellation, and reasoning effort', async () => {
     const bodies: Record<string, unknown>[] = [];
     const client = new DshRpcClient(config, async (_input, init) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       bodies.push(body);
       const method = body.method;
-      const value = method === 'session/selectModel' ? { selected: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' } } : method === 'workspace/archiveSession' ? { archivedSessionIds: ['session-test'] } : { accepted: true };
+      const value = method === 'session/selectModel' ? { selected: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' } } : { accepted: true };
       return jsonResponse({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value } });
     });
     await client.session.selectModel({ sessionId: 'session-test', provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' });
     await client.session.cancel({ sessionId: 'session-test' });
-    await client.workspace.archiveSession({ sessionId: 'session-test' });
-    expect(bodies.map((body) => body.method)).toEqual(['session/selectModel', 'session/cancel', 'workspace/archiveSession']);
+    expect(bodies.map((body) => body.method)).toEqual(['session/selectModel', 'session/cancel']);
     expect(bodies[0]).toMatchObject({ payload: { args: { request: { sessionId: 'session-test', provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' } } } });
     expect(bodies[1]).toMatchObject({ payload: { args: { request: { sessionId: 'session-test' } } } });
-    expect(bodies[2]).toMatchObject({ payload: { args: { request: { sessionId: 'session-test' } } } });
   });
 
-  it('returns tool errors for DSH command failures and unknown commands', async () => {
-    let value: unknown = undefined;
-    const runtime = {
-      turns: new TurnStore(), pending: new PendingInteractionStore(), selectedSessionId: null, events: {},
-      rpc: { commands: { execute: async () => ({ ok: true, value }) } },
-    } as never;
-    const unknown = await callTool(runtime, { sessionId: 'session-test', command: '/missing' }, 'dsh.session.command');
-    expect(unknown).toMatchObject({ isError: true, structuredContent: { error: { code: 'command-not-found' } } });
-    value = { commandId: 'bad', result: { kind: 'error', text: 'failed command' } };
-    const failed = await callTool(runtime, { sessionId: 'session-test', command: '/bad' }, 'dsh.session.command');
-    expect(failed).toMatchObject({ isError: true, structuredContent: { error: { code: 'command-failed', message: 'failed command' } } });
-    value = { commandId: 'ok', result: { kind: 'success', text: 'compacted' } };
-    expect((await callTool(runtime, { sessionId: 'session-test' }, 'dsh.command.compact')).structuredContent).toEqual({ sessionId: 'session-test', compacted: true, message: 'compacted' });
+  it.each(['uncertain', 'rejected'])('retains a stable retry identity for a %s submission', async (failure) => {
+    let calls = 0;
+    const runtime = testRuntime({ events: { sessionSnapshot: async () => followSnapshot() }, rpc: { session: { prompt: async () => {
+      if (calls++ === 0) {
+        if (failure === 'uncertain') throw new DshTransportError('Response lost');
+        return { ok: false, error: new DshDomainError('model-unavailable', 'Select a model first') };
+      }
+      return { ok: true, value: { accepted: true } };
+    } } } });
+    const args = { sessionId: 'retry', requestId: 'stable-request', message: 'Hello' };
+    const first = await callTool(runtime, args);
+    const target = (first.structuredContent as { error: { target: { turnRef: string; requestId: string } } }).error.target;
+    expect(target.requestId).toBe(args.requestId);
+    expect(new TurnStore().restore(target.turnRef)).toMatchObject({ sessionId: 'retry', sourceRef: 'rpc:stable-request' });
+    const retried = await callTool(runtime, args);
+    expect(retried.structuredContent).toMatchObject({ turnRef: target.turnRef, requestId: args.requestId, accepted: true });
+    expect(runtime.turns.get(target.turnRef)?.state).toBe('accepted');
   });
 });
 

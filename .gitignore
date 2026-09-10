@@ -15,3 +15,5 @@ Thumbs.db
 .agents/
 .specify/
 specs/
+.local/
+*.tgz

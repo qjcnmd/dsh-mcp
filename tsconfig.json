@@ -10,9 +10,6 @@
     "exactOptionalPropertyTypes": true,
     "noImplicitOverride": true,
     "noEmitOnError": true,
-    "sourceMap": true,
-    "declaration": true,
-    "declarationMap": true,
     "types": ["node"]
   },
   "include": ["src/**/*.ts"]

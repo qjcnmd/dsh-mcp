@@ -1,8 +1,8 @@
-import type { CallToolResult, McpServer, ServerContext, StandardSchemaWithJSON, ToolCallback } from '@modelcontextprotocol/server';
+import type { McpServer, ServerContext, StandardSchemaWithJSON, ToolCallback } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { DshRuntime } from '../transport.js';
 import { DshDomainError, DshMcpError, isAbortError } from '../../errors.js';
-import { projectToolResult } from '../result-projection.js';
+import { projectToolResult, type ProjectedToolResult } from '../result-projection.js';
 export { projectToolResult };
 
 const errorOutputSchema = z.object({
@@ -13,43 +13,37 @@ const errorOutputSchema = z.object({
   }),
 });
 
+type ErrorOutput = z.infer<typeof errorOutputSchema>;
+export type ToolErrorResult = ProjectedToolResult<ErrorOutput> & { isError: true };
+type ActionResult<O extends StandardSchemaWithJSON> = ProjectedToolResult<StandardSchemaWithJSON.InferOutput<O> & Record<string, unknown>> | ToolErrorResult;
+
 export const idSchema = z.string().trim().min(1);
 export const reasonSchema = z.object({ kind: z.string(), code: z.string().nullable(), message: z.string().nullable() });
 export const modelSelectionSchema = z.object({ provider: z.string(), model: z.string(), reasoningEffort: z.string().nullable() });
-export const sessionSummarySchema = z.object({ sessionId: idSchema, workspaceId: idSchema.nullable(), workspaceTitle: z.string().nullable(), title: z.string().nullable(), cwd: z.string().nullable(), status: z.enum(['running', 'idle']), blank: z.boolean(), updatedAt: z.number(), model: modelSelectionSchema.nullable(), agentPreset: z.string().nullable() });
-export const workspaceSummarySchema = z.object({ workspaceId: idSchema, title: z.string(), path: z.string(), sessionCount: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string() });
-export const questionSchema = z.object({ id: idSchema, question: z.string(), detail: z.string().optional(), header: z.string().optional(), options: z.array(z.object({ label: z.string(), description: z.string().optional() })), multiSelect: z.boolean() });
-export const pendingInteractionSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('approval'), pendingInteractionId: idSchema, sessionId: idSchema, prompt: z.string(), options: z.array(z.object({ outcome: z.enum(['allowed-once', 'rejected']), label: z.string() })) }),
-  z.object({ kind: z.literal('question'), pendingInteractionId: idSchema, sessionId: idSchema, questions: z.array(questionSchema) }),
-]);
+export const sessionSummarySchema = z.object({ sessionId: idSchema, title: z.string().nullable(), status: z.enum(['running', 'idle']), blank: z.boolean(), updatedAt: z.number(), model: modelSelectionSchema.nullable(), unsupportedReason: z.string().nullable() });
+
+const READ_ONLY_ACTIONS = new Set(['dsh.session.list', 'dsh.session.models', 'dsh.session.wait_turn']);
 
 export function requestSignal(ctx: ServerContext): AbortSignal {
   return ctx.mcpReq.signal;
 }
 
-export function registerAction<S extends StandardSchemaWithJSON>(
+export function registerAction<S extends StandardSchemaWithJSON, O extends StandardSchemaWithJSON>(
   server: McpServer,
   name: string,
-  config: { description: string; inputSchema: S; outputSchema: StandardSchemaWithJSON },
-  handler: ToolCallback<S>,
+  config: { description: string; inputSchema: S; outputSchema: O },
+  handler: (args: StandardSchemaWithJSON.InferOutput<S>, ctx: ServerContext) => ActionResult<O> | Promise<ActionResult<O>>,
 ): void {
-  const callback = (async (args: unknown, ctx: ServerContext) => {
+  const callback = (async (args: StandardSchemaWithJSON.InferOutput<S>, ctx: ServerContext) => {
     try {
-      return await (handler as unknown as (args: unknown, ctx: ServerContext) => CallToolResult | Promise<CallToolResult>)(args, ctx);
+      return await handler(args, ctx);
     } catch (error) {
-      if (isAbortError(error)) throw error;
-      if (error instanceof DshDomainError) {
-        return toolExecutionError(error.dshCode, error.message, stringTarget(Object.fromEntries(Object.entries(error.details).filter(([key]) => key !== 'dshCode'))));
-      }
-      if (error instanceof DshMcpError) {
-        return toolExecutionError(error.code, error.message, stringTarget(error.details));
-      }
-      return toolExecutionError('internal-error', error instanceof Error ? error.message : 'Unexpected DSH MCP failure.');
+      return toolError(error);
     }
   }) as ToolCallback<S>;
   server.registerTool<StandardSchemaWithJSON, S>(name, {
     ...config,
+    annotations: { readOnlyHint: READ_ONLY_ACTIONS.has(name), destructiveHint: !READ_ONLY_ACTIONS.has(name), idempotentHint: READ_ONLY_ACTIONS.has(name), openWorldHint: true },
     outputSchema: portableOutputSchema(config.outputSchema),
   }, callback);
 }
@@ -58,11 +52,20 @@ export function toolExecutionError(
   code: string,
   message: string,
   target: Record<string, string> | null = null,
-): CallToolResult {
+): ToolErrorResult {
   return {
     ...projectToolResult({ error: { code, message, target } }, message),
     isError: true,
   };
+}
+
+export function toolError(error: unknown, target: Record<string, string> = {}): ToolErrorResult {
+  if (isAbortError(error)) throw error;
+  if (error instanceof DshMcpError) {
+    const { dshCode: _dshCode, ...details } = error.details;
+    return toolExecutionError(error instanceof DshDomainError ? error.dshCode : error.code, error.message, stringTarget({ ...details, ...target }));
+  }
+  return toolExecutionError('internal-error', error instanceof Error ? error.message : 'Unexpected DSH MCP failure.', stringTarget(target));
 }
 
 export type ActionRuntime = DshRuntime;

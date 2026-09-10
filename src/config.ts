@@ -45,7 +45,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') {
     throw new Error('DSH_BASE_URL must use http or https');
   }
-  const authToken = envToken ?? urlToken;
+  const authToken = envToken || urlToken;
   return {
     baseUrl,
     ...(authToken === undefined || authToken === '' ? {} : { authToken }),

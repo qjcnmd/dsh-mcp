@@ -1,12 +1,20 @@
 {
   "name": "@qjcnmd/dsh-mcp",
   "version": "0.1.0",
-  "private": true,
-  "description": "A host-neutral local MCP server for the DSH work surface",
+  "description": "Use DSH minimal, full-access sessions from any MCP client in the same project",
+  "license": "MIT",
+  "bin": {
+    "dsh-mcp": "dist/server.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/qjcnmd/dsh-mcp.git"
   },
+  "homepage": "https://github.com/qjcnmd/dsh-mcp#readme",
+  "bugs": "https://github.com/qjcnmd/dsh-mcp/issues",
   "files": [
     "dist",
     "README.md"
@@ -18,15 +26,16 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "prepack": "npm run build",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tests/tsconfig.json --noEmit",
     "test": "vitest run --config vitest.config.ts",
     "test:live": "npm run build && node tests/integration/live-smoke.mjs",
+    "test:package": "npm run build && node tests/integration/package-smoke.mjs",
     "test:watch": "vitest --config vitest.config.ts",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js"

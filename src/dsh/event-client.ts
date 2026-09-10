@@ -3,13 +3,11 @@ import type { RawData } from 'ws';
 import type { DshConfig } from '../config.js';
 import { DshDomainError, DshProtocolError, DshTransportError } from '../errors.js';
 import { DshAuthSession, type FetchLike } from './auth.js';
-import { DshRpcClient, type RpcResult, type SessionHistoryRecord } from './rpc-client.js';
-
-export type DshEventStream = 'mux' | 'host';
+import type { SessionHistoryRecord } from './rpc-client.js';
+import { assertSupportedSession } from './session-scope.js';
+import { isRecord } from '../value-guards.js';
 
 export interface DshEvent {
-  stream: DshEventStream;
-  rpcId: string;
   method: string;
   payload: unknown;
 }
@@ -25,35 +23,10 @@ export interface SessionFollowSnapshot {
   projections: { asOfSeq: number; values: Record<string, unknown> };
 }
 
-export interface WorkspaceBaseline {
-  items: DshWorkspaceView[];
-  archivedSessionIds: string[];
-}
-
-export interface DshWorkspaceView {
-  workspaceId: string;
-  path: string;
-  title: string;
-  sessionIds: string[];
-  createdAt: string;
-  updatedAt: string;
-}
-
 type RemoteFrame =
   | { type: 'item'; streamId: string; value?: unknown }
   | { type: 'end'; streamId: string }
   | { type: 'error'; streamId: string; error: { code: string; message: string; details: Record<string, unknown> } };
-
-interface RemoteInteractionRef {
-  clientId: string;
-  eventId: string;
-  sessionId: string;
-  event: 'approval/request' | 'user-questions/request';
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function decodeRawData(data: RawData): string {
   if (typeof data === 'string') return data;
@@ -94,93 +67,64 @@ function isSessionSnapshot(value: unknown): value is SessionFollowSnapshot {
 
 export class DshEventClient {
   private readonly auth: DshAuthSession;
-  private readonly rpc: DshRpcClient;
-  private readonly listeners = new Set<DshEventListener>();
-  private readonly remoteSessionRefs = new Map<string, number>();
-  private readonly remoteInteractions = new Map<string, RemoteInteractionRef>();
-  private remoteController: AbortController | undefined;
-  private remoteClientId: string | undefined;
 
   constructor(private readonly config: DshConfig, fetchOrAuth: FetchLike | DshAuthSession = globalThis.fetch) {
     this.auth = fetchOrAuth instanceof DshAuthSession ? fetchOrAuth : new DshAuthSession(config, fetchOrAuth);
-    this.rpc = new DshRpcClient(config, this.auth);
   }
 
-  async workspaceSnapshot(signal?: AbortSignal): Promise<WorkspaceBaseline> {
-    const frame = await this.firstFrame('workspace/follow', { args: {} }, (value) => isRecord(value) && value.type === 'baseline', signal);
-    if (!isRecord(frame) || !isRecord(frame.value) || !Array.isArray(frame.value.items) || !Array.isArray(frame.value.archivedSessionIds)) {
-      throw new DshProtocolError('DSH returned an invalid workspace baseline');
+  async archivedSessionIds(signal?: AbortSignal): Promise<string[]> {
+    const frame = await this.firstFrame('workspace/follow', { args: {} }, 'baseline', signal);
+    if (!isRecord(frame) || !isRecord(frame.value) || !Array.isArray(frame.value.archivedSessionIds) || !frame.value.archivedSessionIds.every((id) => typeof id === 'string')) {
+      throw new DshProtocolError('DSH returned invalid archived session IDs');
     }
-    return {
-      items: frame.value.items.filter(isWorkspaceView),
-      archivedSessionIds: frame.value.archivedSessionIds.filter((value): value is string => typeof value === 'string'),
-    };
+    return frame.value.archivedSessionIds;
   }
 
   async sessionSnapshot(sessionId: string, maxMessages = 20, signal?: AbortSignal): Promise<SessionFollowSnapshot> {
-    const frame = await this.firstFrame('session/follow', { args: { request: { address: { kind: 'session', sessionId }, maxMessages } } }, isSessionSnapshot, signal);
+    const frame = await this.firstFrame('session/follow', { args: { request: { address: { kind: 'session', sessionId }, maxMessages } } }, 'snapshot', signal);
     if (!isSessionSnapshot(frame)) throw new DshProtocolError('DSH returned an invalid session snapshot', { sessionId });
+    assertSupportedSession(frame);
     return frame;
   }
 
   subscribeSession(sessionId: string, listener: DshEventListener, signal?: AbortSignal): () => void {
     const controller = new AbortController();
-    let stopped = false;
-    // Pending interactions outlive a wait call and still need cancellation/failure events.
-    const detach = () => {
-      if (stopped && ![...this.remoteInteractions.values()].some((ref) => ref.sessionId === sessionId)) this.listeners.delete(forward);
-    };
-    const forward: DshEventListener = (event) => {
-      const payload = isRecord(event.payload) ? event.payload : undefined;
-      if (payload?.sessionId === sessionId) {
-        listener(event);
-        detach();
-      }
-    };
-    this.listeners.add(forward);
-    this.retainRemoteEvents(sessionId);
-    void this.runLogicalStream(
-      'session/follow',
-      { args: { request: { address: { kind: 'session', sessionId }, maxMessages: 20 } } },
-      (value) => this.emitSessionFollow(value, sessionId),
-      controller.signal,
-    ).catch((error) => {
-      if (!controller.signal.aborted) this.emitStreamError('mux', 'session/follow', error, sessionId);
-    });
-
+    const openingTimer = setTimeout(() => fail(new DshTransportError('DSH session observation opening timed out')), this.config.requestTimeoutMs);
     const stop = () => {
-      if (stopped) return;
-      stopped = true;
+      clearTimeout(openingTimer);
       controller.abort();
       signal?.removeEventListener('abort', stop);
-      this.releaseRemoteEvents(sessionId);
-      detach();
     };
-    if (signal !== undefined) {
-      if (signal.aborted) stop();
-      else signal.addEventListener('abort', stop, { once: true });
-    }
+    const fail = (error: unknown) => {
+      if (controller.signal.aborted) return;
+      stop();
+      listener({ method: 'stream/error', payload: error });
+    };
+    void this.runLogicalStream('session/follow', { args: { request: { address: { kind: 'session', sessionId }, maxMessages: 20 } } }, (value) => {
+      if (isRecord(value) && value.type === 'snapshot') {
+        if (!isSessionSnapshot(value)) throw new DshProtocolError('DSH returned an invalid session snapshot', { sessionId });
+        assertSupportedSession(value);
+        clearTimeout(openingTimer);
+        listener({ method: 'session/snapshot', payload: { sessionId, snapshot: value } });
+      } else if (isRecord(value) && value.type === 'event' && isRecord(value.event)) {
+        listener({ method: 'session/follow', payload: { sessionId, event: value.event } });
+      }
+    }, controller.signal).then(() => {
+      if (!controller.signal.aborted) fail(new DshTransportError('DSH session observation ended unexpectedly'));
+    }, fail);
+    if (signal?.aborted) stop();
+    else signal?.addEventListener('abort', stop, { once: true });
     return stop;
   }
 
-  async respondRemoteInteraction(eventId: string, value: unknown, signal?: AbortSignal): Promise<RpcResult<undefined>> {
-    const ref = this.remoteInteractions.get(eventId);
-    if (ref === undefined) {
-      return { ok: false, error: new DshDomainError('pending-interaction-not-found', 'The pending interaction is no longer available.', { eventId }) };
-    }
-    const result = await this.rpc.remoteEvents.result({ clientId: ref.clientId, eventId: ref.eventId, outcome: { kind: 'result', value } }, signal);
-    if (result.ok) this.resolveRemoteInteraction(eventId);
-    return result;
-  }
-
-  private async firstFrame(endpoint: string, payload: Record<string, unknown>, accepts: (value: unknown) => boolean, signal?: AbortSignal): Promise<unknown> {
+  private async firstFrame(endpoint: string, payload: Record<string, unknown>, frameType: 'baseline' | 'snapshot', signal?: AbortSignal): Promise<unknown> {
     const controller = new AbortController();
     const combined = signal === undefined ? controller.signal : AbortSignal.any([controller.signal, signal]);
     const timer = setTimeout(() => controller.abort(new DshTransportError(`DSH ${endpoint} opening baseline timed out`, null, { endpoint })), this.config.requestTimeoutMs);
     return new Promise<unknown>((resolve, reject) => {
       let settled = false;
       void this.runLogicalStream(endpoint, payload, (value) => {
-        if (settled || !accepts(value)) return;
+        if (settled || !isRecord(value) || value.type !== frameType) return;
         settled = true;
         resolve(value);
         controller.abort();
@@ -192,104 +136,7 @@ export class DshEventClient {
     }).finally(() => { clearTimeout(timer); controller.abort(); });
   }
 
-  private retainRemoteEvents(sessionId: string): void {
-    this.remoteSessionRefs.set(sessionId, (this.remoteSessionRefs.get(sessionId) ?? 0) + 1);
-    if (this.remoteController !== undefined) return;
-    const controller = new AbortController();
-    this.remoteController = controller;
-    void this.runLogicalStream('$events', { args: {} }, (value) => this.handleRemoteEvent(value), controller.signal).then(() => {
-      if (!controller.signal.aborted) throw new DshTransportError('DSH remote events ended unexpectedly');
-    }).catch((error) => {
-      if (controller.signal.aborted) return;
-      const sessions = new Set([...this.remoteSessionRefs.keys(), ...[...this.remoteInteractions.values()].map((ref) => ref.sessionId)]);
-      this.remoteInteractions.clear();
-      for (const sessionId of sessions) this.emitStreamError('host', '$events', error, sessionId);
-    }).finally(() => {
-      if (this.remoteController === controller) {
-        this.remoteController = undefined;
-        this.remoteClientId = undefined;
-      }
-    });
-  }
-
-  private releaseRemoteEvents(sessionId: string): void {
-    const count = this.remoteSessionRefs.get(sessionId) ?? 0;
-    if (count <= 1) this.remoteSessionRefs.delete(sessionId);
-    else this.remoteSessionRefs.set(sessionId, count - 1);
-    this.maybeStopRemoteEvents();
-  }
-
-  private maybeStopRemoteEvents(): void {
-    if (this.remoteSessionRefs.size !== 0 || this.remoteInteractions.size !== 0) return;
-    this.remoteController?.abort();
-    this.remoteController = undefined;
-  }
-
-  private resolveRemoteInteraction(eventId: string): void {
-    const ref = this.remoteInteractions.get(eventId);
-    this.remoteInteractions.delete(eventId);
-    if (ref !== undefined) this.emit({ stream: 'host', rpcId: eventId, method: 'remote/cancel', payload: { sessionId: ref.sessionId } });
-    this.maybeStopRemoteEvents();
-  }
-
-  private handleRemoteEvent(value: unknown): void {
-    if (!isRecord(value)) return;
-    if (value.type === 'ready' && typeof value.clientId === 'string') {
-      this.remoteClientId = value.clientId;
-      return;
-    }
-    if (value.type === 'cancel' && typeof value.eventId === 'string') {
-      this.resolveRemoteInteraction(value.eventId);
-      return;
-    }
-    if (value.type !== 'waterfall'
-      || typeof value.eventId !== 'string'
-      || typeof value.agentId !== 'string'
-      || (value.event !== 'approval/request' && value.event !== 'user-questions/request')
-      || !isRecord(value.request)) return;
-    const clientId = this.remoteClientId;
-    if (clientId === undefined) return;
-    const ref: RemoteInteractionRef = { clientId, eventId: value.eventId, sessionId: value.agentId, event: value.event };
-    if (!this.remoteSessionRefs.has(ref.sessionId)) {
-      void this.rpc.remoteEvents.result({ clientId: ref.clientId, eventId: ref.eventId, outcome: { kind: 'next' } }).catch(() => undefined);
-      return;
-    }
-    this.remoteInteractions.set(ref.eventId, ref);
-    this.emit({
-      stream: 'host',
-      rpcId: ref.eventId,
-      method: ref.event,
-      payload: { type: 'remote/invocation', sessionId: ref.sessionId, clientId: ref.clientId, eventId: ref.eventId, request: value.request },
-    });
-  }
-
-  private emitSessionFollow(value: unknown, sessionId: string): void {
-    if (isSessionSnapshot(value)) {
-      for (const record of value.records) this.emitHistoryRecord(record, sessionId);
-      return;
-    }
-    this.emitHistoryRecord(value, sessionId);
-  }
-
-  private emitHistoryRecord(value: unknown, sessionId: string): void {
-    if (!isRecord(value) || value.type !== 'event' || !isRecord(value.event)) return;
-    this.emit({ stream: 'mux', rpcId: '', method: 'session/follow', payload: { type: 'session/event', sessionId, event: value.event } });
-  }
-
-  private emitStreamError(stream: DshEventStream, endpoint: string, error: unknown, sessionId?: string): void {
-    this.emit({
-      stream,
-      rpcId: '',
-      method: 'stream/error',
-      payload: { endpoint, ...(sessionId === undefined ? {} : { sessionId }), message: error instanceof Error ? error.message : String(error) },
-    });
-  }
-
-  private emit(event: DshEvent): void {
-    for (const listener of [...this.listeners]) listener(event);
-  }
-
-  private async runLogicalStream(endpoint: string, payload: Record<string, unknown>, onItem: (value: unknown) => void, signal: AbortSignal): Promise<void> {
+  private async runLogicalStream(endpoint: string, payload: Record<string, unknown>, onItem: (value: unknown) => void, signal: AbortSignal, refreshed = false): Promise<void> {
     signal.throwIfAborted();
     const cookie = await this.auth.cookieHeader(signal);
     signal.throwIfAborted();
@@ -304,12 +151,12 @@ export class DshEventClient {
           if (settled) return;
           settled = true;
           cleanup();
-          socket.terminate();
+          disposeSocket(socket);
           reject(new DshTransportError('DSH Remote stream connection timed out', null, { endpoint }));
         }, this.config.streamConnectTimeoutMs);
         const opened = () => { if (!settled) { settled = true; cleanup(); resolve(); } };
         const failed = (error: Error) => { if (!settled) { settled = true; cleanup(); reject(new DshTransportError(error.message, null, { endpoint })); } };
-        const aborted = () => { if (!settled) { settled = true; cleanup(); socket.terminate(); reject(signal.reason ?? new DOMException('Operation aborted', 'AbortError')); } };
+        const aborted = () => { if (!settled) { settled = true; cleanup(); disposeSocket(socket); reject(signal.reason ?? new DOMException('Operation aborted', 'AbortError')); } };
         const cleanup = () => {
           clearTimeout(timer);
           socket.off('open', opened);
@@ -318,6 +165,13 @@ export class DshEventClient {
         };
         socket.once('open', opened);
         socket.once('error', failed);
+        socket.once('unexpected-response', (_request, response) => {
+          response.resume();
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(new DshTransportError('DSH WebSocket authentication failed', response.statusCode ?? null, { endpoint }));
+        });
         signal.addEventListener('abort', aborted, { once: true });
       });
       signal.throwIfAborted();
@@ -336,7 +190,7 @@ export class DshEventClient {
             if (frame.streamId !== streamId) return;
             if (frame.type === 'item') { onItem(frame.value); return; }
             if (frame.type === 'end') { finish(resolve); return; }
-            finish(() => reject(new DshTransportError(`DSH Remote stream ${frame.error.code}: ${frame.error.message}`, null, { endpoint, details: frame.error.details })));
+            finish(() => reject(new DshDomainError(frame.error.code, frame.error.message, { endpoint, ...frame.error.details })));
           } catch (error) {
             finish(() => reject(error));
           }
@@ -358,13 +212,23 @@ export class DshEventClient {
         socket.once('close', onClose);
         signal.addEventListener('abort', onAbort, { once: true });
       });
+    } catch (error) {
+      if (!refreshed && error instanceof DshTransportError && error.status === 401) {
+        disposeSocket(socket);
+        await this.auth.refreshCookie(signal);
+        return this.runLogicalStream(endpoint, payload, onItem, signal, true);
+      }
+      throw error;
     } finally {
-      if (socket.readyState === WebSocket.OPEN) socket.close();
-      else if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+      disposeSocket(socket);
     }
   }
 }
 
-function isWorkspaceView(value: unknown): value is DshWorkspaceView {
-  return isRecord(value) && typeof value.workspaceId === 'string' && typeof value.path === 'string' && typeof value.title === 'string' && Array.isArray(value.sessionIds) && value.sessionIds.every((id) => typeof id === 'string') && typeof value.createdAt === 'string' && typeof value.updatedAt === 'string';
+function disposeSocket(socket: WebSocket): void {
+  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    socket.once('error', () => undefined); // ws reports the intentional handshake cancellation asynchronously.
+    if (socket.readyState === WebSocket.OPEN) socket.close();
+    else socket.terminate();
+  }
 }

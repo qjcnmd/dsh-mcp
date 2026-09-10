@@ -1,202 +1,191 @@
-import { spawn } from 'node:child_process';
+import { StdioClient } from './stdio-client.mjs';
 import { randomUUID } from 'node:crypto';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DshRpcClient } from '../../dist/dsh/rpc-client.js';
+import { DshEventClient } from '../../dist/dsh/event-client.js';
+import { loadConfig } from '../../dist/config.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const validationModel = { provider: 'aliyun', model: 'qwen3.8-flash', reasoningEffort: 'high' };
-const child = spawn(process.execPath, ['dist/server.js'], { cwd: root, env: { ...process.env, DSH_BASE_URL: process.env.DSH_BASE_URL ?? 'http://127.0.0.1:3080/', DSH_MCP_LOG_LEVEL: 'silent' }, stdio: ['pipe', 'pipe', 'pipe'] });
-let nextId = 1;
-let stdout = '';
-let stderr = '';
-const pending = new Map();
+const shellTool = process.platform === 'win32' ? 'pwsh' : 'bash';
+const availableCases = ['recovery', 'steering', 'cancellation'];
+const selectedCases = new Set(process.argv.length > 2 ? process.argv.slice(2) : availableCases);
+for (const name of selectedCases) if (!availableCases.includes(name)) throw new Error('Unknown live test case: ' + name);
+const clients = new Set();
 const createdSessions = [];
 const cleanupFailures = [];
-let testDirectory;
-let approvalDirectory;
+const tempRoot = resolve(tmpdir());
+const probeDirectory = await mkdtemp(resolve(tempRoot, 'dsh-mcp-live-'));
+const rpc = new DshRpcClient(loadConfig());
+const events = new DshEventClient(loadConfig());
+let client;
 let failure;
 let summary;
 
-child.stdout.setEncoding('utf8');
-child.stdout.on('data', (chunk) => {
-  stdout += chunk;
-  for (let newline = stdout.indexOf('\n'); newline >= 0; newline = stdout.indexOf('\n')) {
-    const line = stdout.slice(0, newline).trim();
-    stdout = stdout.slice(newline + 1);
-    if (line !== '') consume(JSON.parse(line));
-  }
-});
-child.stderr.setEncoding('utf8');
-child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4_000); });
-child.once('exit', (code) => {
-  for (const waiter of pending.values()) waiter.reject(new Error(`MCP process exited with code ${String(code)}: ${redact(stderr)}`));
-  pending.clear();
-});
-
 try {
-  await request('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'dsh-mcp-live-smoke', version: '1' } });
-  notify('notifications/initialized');
-  const listed = await request('tools/list', {});
-  if (!Array.isArray(listed.tools) || listed.tools.length !== 19 || listed.tools.some((tool) => tool.outputSchema === undefined)) throw new Error('Expected 19 tools with output schemas');
+  client = await connect();
+  const listed = await client.request('tools/list', {});
+  if (!Array.isArray(listed.tools) || listed.tools.some((tool) => !tool.outputSchema || !tool.annotations)) throw new Error('Tools must advertise output schemas and annotations');
+  if (listed.tools.length !== 7) throw new Error('Expected exactly seven tools');
 
-  const workspacePage = await tool('dsh.workspace.list', { limit: 100 });
-  if (workspacePage.value.items.length === 0) throw new Error('DSH returned no workspaces');
-  const queriedWorkspaces = await tool('dsh.workspace.list', { query: workspacePage.value.items[0].workspaceId });
-  if (!queriedWorkspaces.value.items.some((item) => item.workspaceId === workspacePage.value.items[0].workspaceId)) throw new Error('Workspace query did not preserve its target');
+  const catalog = await tool('dsh.session.models', {});
+  const provider = process.env.DSH_TEST_PROVIDER ?? catalog.value.selection.provider;
+  const modelId = process.env.DSH_TEST_MODEL ?? (catalog.value.selection.provider === provider ? catalog.value.selection.model : catalog.value.models.find((item) => item.provider === provider)?.model);
+  const advertised = catalog.value.models.find((item) => item.provider === provider && item.model === modelId);
+  if (!advertised) throw new Error('The requested test provider/model is absent from the current DSH catalog');
+  const effort = process.env.DSH_TEST_REASONING_EFFORT ?? (catalog.value.selection.provider === provider && catalog.value.selection.model === modelId ? catalog.value.selection.reasoningEffort : advertised.defaultReasoningEffort);
+  if (effort && !advertised.reasoningEfforts.includes(effort)) throw new Error('The test reasoning effort is not advertised for this model');
+  const model = { provider, model: modelId, ...(effort ? { reasoningEffort: effort } : {}) };
+  report('model', model);
 
-  const hundred = await tool('dsh.session.list', { limit: 100 });
-  if (hundred.value.items.length < 100) throw new Error(`Expected at least 100 visible sessions, received ${hundred.value.items.length}`);
-  const first = await tool('dsh.session.list', { status: 'idle', limit: 3 });
-  if (!first.value.hasMore || typeof first.value.nextCursor !== 'string') throw new Error('Session paging did not return a continuation');
-  const second = await tool('dsh.session.list', { status: 'idle', limit: 3, cursor: first.value.nextCursor });
-  const firstIds = new Set(first.value.items.map((item) => item.sessionId));
-  if (second.value.items.some((item) => firstIds.has(item.sessionId))) throw new Error('Session pages overlap');
-  const queryTarget = hundred.value.items[0];
-  const queryResult = await tool('dsh.session.list', { query: queryTarget.sessionId, limit: 20 });
-  if (!queryResult.value.items.some((item) => item.sessionId === queryTarget.sessionId)) throw new Error('Session metadata query did not preserve its target');
-  const workspaceWithSessions = workspacePage.value.items.find((item) => item.sessionCount > 0);
-  if (workspaceWithSessions !== undefined) {
-    const filtered = await tool('dsh.session.list', { workspaceId: workspaceWithSessions.workspaceId, limit: 100 });
-    if (filtered.value.items.some((item) => item.workspaceId !== workspaceWithSessions.workspaceId)) throw new Error('Workspace filter returned a mismatched session');
+  const initialSessions = await tool('dsh.session.list', { cwd: probeDirectory });
+  if (initialSessions.value.cwd !== probeDirectory) throw new Error('The MCP did not use the requested workspace');
+  const otherWorkspace = await tool('dsh.session.list', { cwd: root });
+  if (otherWorkspace.value.cwd !== root) throw new Error('The same MCP cannot list another workspace');
+
+  if (selectedCases.has('recovery')) {
+    const sessionId = await createSession();
+    await selectModel(sessionId, model);
+    const nativeSnapshot = await events.sessionSnapshot(sessionId);
+    if (nativeSnapshot.projections.values.agentPreset !== 'minimal') throw new Error('Session is not using the actual minimal preset');
+
+    const requestId = randomUUID();
+    const message = 'Reply with exactly: DSH MCP smoke test passed.';
+    const sent = await tool('dsh.session.send_message', { sessionId, requestId, message });
+    const repeated = await tool('dsh.session.send_message', { sessionId, requestId, message });
+    if (sent.value.turnRef !== repeated.value.turnRef) throw new Error('A repeated logical submission changed its handle');
+    const completed = await waitTurn(sent.value.turnRef);
+    requireState(completed.value, ['completed'], 'basic turn');
+    if (!completed.text.includes('DSH MCP smoke test passed.')) throw new Error('Missing final model response');
+    if (JSON.stringify(completed.value).includes('DSH MCP smoke test passed.')) throw new Error('Final response duplicated in metadata');
+    const snapshot = await events.sessionSnapshot(sessionId);
+    const admitted = snapshot.records.filter(({ event }) => event.type === 'user/message' && event.surfaceOp === 'append' && event.data?.source?.rpcId === requestId);
+    if (admitted.length !== 1) throw new Error('Repeated request was admitted more than once');
+    await restart();
+    const recovered = await waitTurn(sent.value.turnRef);
+    requireState(recovered.value, ['completed'], 'cross-process wait');
+    if (!recovered.text.includes('DSH MCP smoke test passed.')) throw new Error('Recovered response was incomplete');
+    const adopted = await tool('dsh.session.wait_turn', { sessionId, timeoutMs: 30_000 });
+    requireState(adopted.value, ['completed'], 'existing-session takeover');
+    // Change only the thinking effort before a second turn in the same session.
+    const otherEffort = advertised.reasoningEfforts.find((value) => value !== effort);
+    const nextSelection = { ...model, ...(otherEffort ? { reasoningEffort: otherEffort } : {}) };
+    await selectModel(sessionId, nextSelection);
+    const target = resolve(probeDirectory, 'shared-project.txt');
+    const script = process.platform === 'win32'
+      ? "[System.IO.File]::WriteAllText('" + target.replaceAll("'", "''") + "', (Get-Location).Path); exit"
+      : 'pwd > ' + shellQuote(target) + '; exit';
+    const next = await tool('dsh.session.send_message', { sessionId, message: 'Call ' + shellTool + ' once with this exact script: ' + script + '. Then reply exactly PROJECT VERIFIED. The exit closes only this test session terminal.' });
+    const result = await waitTurn(next.value.turnRef);
+    requireState(result.value, ['completed'], 'continued session with changed thinking effort');
+    if ((await readFile(target, 'utf8')).trim() !== probeDirectory) throw new Error('DSH did not execute from the requested workspace');
+    report('durable-recovery', { repeatedRequestOnce: true, sessionTakeover: true, continuation: true, thinkingEffort: nextSelection.reasoningEffort, hostSelectedWorkspaceWrite: true });
   }
 
-  testDirectory = await mkdtemp(resolve(tmpdir(), 'dsh-mcp-live-'));
-  const presetSessionId = await createSession('preset', 'simple');
-  const preset = await tool('dsh.agent_preset.select', { sessionId: presetSessionId, agentPreset: 'standard' });
-  if (preset.value.agentPreset !== 'standard') throw new Error('Preset selection was not confirmed');
+  if (selectedCases.has('steering')) {
+    const sessionId = await createSession(model);
+    const first = await tool('dsh.session.send_message', { sessionId, message: 'Call ' + shellTool + ' once with ' + sleepCommand(5) + '; exit, then reply exactly FIRST DONE.' });
+    const progress = await tool('dsh.session.wait_turn', { turnRef: first.value.turnRef, timeoutMs: 500 });
+    requireState(progress.value, ['timed_out'], 'active work before steering');
+    const second = await tool('dsh.session.send_message', { sessionId, message: 'Update to the current task: after the command finishes, reply exactly STEER VERIFIED instead of FIRST DONE. Do not run another command.' });
+    const firstResult = await waitTurn(first.value.turnRef);
+    const secondResult = await waitTurn(second.value.turnRef);
+    requireState(firstResult.value, ['completed'], 'steered task');
+    requireState(secondResult.value, ['completed'], 'steering receipt');
+    if (!firstResult.text.includes('STEER VERIFIED') || !secondResult.text.includes('STEER VERIFIED')) throw new Error('The active task did not use the steering instruction');
+    const snapshot = await events.sessionSnapshot(sessionId);
+    const turns = snapshot.records.filter(({ event }) => event.type === 'turn/start');
+    const requestIds = snapshot.records.filter(({ event }) => event.type === 'user/message' && event.surfaceOp === 'append').map(({ event }) => event.data?.source?.rpcId);
+    if (turns.length !== 1 || ![first.value.requestId, second.value.requestId].every((id) => requestIds.includes(id))) throw new Error('Steering should join the active turn');
+    report('steering', { activeTurnUpdated: true, bothReceiptsCompleted: true });
+  }
 
-  const sessionId = await createSession('surface', 'simple');
-  if ((await tool('dsh.page.select_session', { sessionId })).value.selectedSessionId !== sessionId) throw new Error('Read-context selection failed');
-  if ((await tool('dsh.page.get_context', {})).value.selectedSessionId !== sessionId) throw new Error('Read context did not retain the target');
-  const models = await tool('dsh.session.models', { sessionId });
-  const modelAdvertised = models.value.models.some((item) => item.provider === validationModel.provider && item.model === validationModel.model && item.reasoningEfforts.includes(validationModel.reasoningEffort));
-  await tool('dsh.session.select_model', { sessionId, ...validationModel });
-  const selected = await tool('dsh.session.models', { sessionId });
-  if (JSON.stringify(selected.value.selection) !== JSON.stringify(validationModel)) throw new Error(`Model selection mismatch: ${JSON.stringify(selected.value.selection)}`);
-  await tool('dsh.session.command', { sessionId, command: '/permission' });
+  if (selectedCases.has('cancellation')) {
+    const cancelSessionId = await createSession(model);
+    const cancelSent = await tool('dsh.session.send_message', { sessionId: cancelSessionId, message: 'Call ' + shellTool + ' with ' + sleepCommand(20) + ', then write a long response.' });
+    const cancelWait = waitTurn(cancelSent.value.turnRef);
+    await delay(500);
+    await tool('dsh.session.cancel', { sessionId: cancelSessionId });
+    requireState((await cancelWait).value, ['cancelled'], 'cancelled turn');
+    const resumed = await tool('dsh.session.send_message', { sessionId: cancelSessionId, message: 'The previous task is cancelled. Reply exactly RESUMED, without using tools.' });
+    const result = await waitTurn(resumed.value.turnRef);
+    requireState(result.value, ['completed'], 'continued session after cancellation');
+    if (!result.text.includes('RESUMED')) throw new Error('Cancelled session did not accept a new task');
+    report('cancellation', { cancelled: true, continuation: true });
+  }
 
-  const sent = await tool('dsh.session.send_message', { sessionId, message: 'Reply with exactly: DSH MCP smoke test passed.' });
-  if (sent.value.mode !== 'steer') throw new Error('Omitted message mode was not steer');
-  const completed = await waitTurn(sent.value.turnRef, 180_000);
-  requireState(completed.value, ['completed'], 'basic turn');
-  if (!completed.text.includes('DSH MCP smoke test passed.')) throw new Error(`Unexpected final response: ${completed.text}`);
-  if (JSON.stringify(completed.value).includes('DSH MCP smoke test passed.')) throw new Error('Final response was duplicated in structured metadata');
-  const history = await tool('dsh.session.history', { sessionId });
-  if (history.value.turns.length !== 1 || !history.value.turns[0].finalResponse?.includes('DSH MCP smoke test passed.')) throw new Error('Projected history did not return the completed turn');
-  await tool('dsh.session.snapshot', { sessionId });
-  await tool('dsh.session.context_stats', { sessionId });
-  await tool('dsh.command.compact', { sessionId });
-
-  const queueSessionId = await createSession('queue', 'simple', validationModel);
-  const queueFirst = await tool('dsh.session.send_message', { sessionId: queueSessionId, message: 'Call pwsh once with Start-Sleep -Seconds 3, then reply exactly FIRST DONE.' });
-  await delay(250);
-  const queued = await tool('dsh.session.send_message', { sessionId: queueSessionId, message: 'Reply exactly SECOND DONE.', mode: 'queue' });
-  if (queued.value.mode !== 'queue') throw new Error('Explicit queue mode was not preserved');
-  requireState((await waitTurn(queueFirst.value.turnRef, 180_000)).value, ['completed'], 'first queued-session turn');
-  requireState((await waitTurn(queued.value.turnRef, 180_000)).value, ['completed'], 'queued turn');
-
-  approvalDirectory = await mkdtemp(resolve(dirname(root), 'dsh-mcp-approval-'));
-  const approvalTarget = resolve(approvalDirectory, 'blocked-write.txt');
-  const approvalSessionId = await createSession('approval', 'simple', validationModel);
-  await tool('dsh.session.command', { sessionId: approvalSessionId, command: '/permission workspace-write' });
-  const approvalSent = await tool('dsh.session.send_message', { sessionId: approvalSessionId, message: `Call pwsh exactly once to write "approval probe" to ${approvalTarget}. Request danger-full-access with a concise justification and wait for the decision.` });
-  const approvalWait = await waitTurn(approvalSent.value.turnRef, 180_000);
-  const approval = requireInteraction(approvalWait.value, 'approval');
-  await tool('dsh.session.respond_approval', { sessionId: approvalSessionId, pendingInteractionId: approval.pendingInteractionId, outcome: 'rejected' });
-  const approvalFinal = waitTurn(approvalSent.value.turnRef, 180_000);
-  await delay(500);
-  await tool('dsh.session.cancel', { sessionId: approvalSessionId });
-  requireState((await approvalFinal).value, ['cancelled', 'completed', 'failed', 'interrupted'], 'approval turn');
-  if (await exists(approvalTarget)) throw new Error('Rejected approval wrote the target file');
-
-  const questionSessionId = await createSession('question', 'simple', validationModel);
-  const questionSent = await tool('dsh.session.send_message', { sessionId: questionSessionId, message: 'Call ask_user_question exactly once. Ask one question with id "continue", text "Continue the MCP validation?", and options "yes" and "no". Then reply exactly QUESTION ANSWER RECEIVED.' });
-  const question = requireInteraction((await waitTurn(questionSent.value.turnRef, 180_000)).value, 'question');
-  const answers = question.questions.map((item) => ({ id: item.id, selected: item.options[0] === undefined ? [] : [item.options[0].label], ...(item.options[0] === undefined ? { custom: 'yes' } : {}) }));
-  await tool('dsh.session.answer_question', { sessionId: questionSessionId, pendingInteractionId: question.pendingInteractionId, answers });
-  requireState((await waitTurn(questionSent.value.turnRef, 180_000)).value, ['completed'], 'question turn');
-
-  const cancelSessionId = await createSession('cancel', 'simple', validationModel);
-  const cancelSent = await tool('dsh.session.send_message', { sessionId: cancelSessionId, message: 'Call pwsh with Start-Sleep -Seconds 20, then write a long response.' });
-  const cancelWait = waitTurn(cancelSent.value.turnRef, 180_000);
-  await delay(500);
-  await tool('dsh.session.cancel', { sessionId: cancelSessionId });
-  requireState((await cancelWait).value, ['cancelled'], 'cancelled turn');
-
-  summary = { ok: true, toolCount: listed.tools.length, visibleSessionCount: hundred.value.items.length, model: validationModel, modelAdvertised, states: { completed: completed.value.state, approval: 'input_required', question: 'input_required', cancellation: 'cancelled', queue: 'completed' }, finalResponseOnce: true };
+  summary = { ok: true, toolCount: listed.tools.length, visibleSessionCount: initialSessions.value.items.length, model, checks: [...selectedCases] };
 } catch (error) {
   failure = error;
 } finally {
   for (const sessionId of createdSessions.reverse()) {
     try { await tool('dsh.session.cancel', { sessionId }); } catch (error) { cleanupFailures.push(error); }
-    try {
-      const receipt = await tool('dsh.session.archive', { sessionId });
-      if (receipt.value.archived !== true) throw new Error(`Archive not confirmed for ${sessionId}`);
-    } catch (error) { cleanupFailures.push(error); }
+    try { await raw('workspace/archiveSession', { request: { sessionId } }); } catch (error) { cleanupFailures.push(error); }
   }
-  for (const path of [approvalDirectory, testDirectory]) {
-    if (path === undefined) continue;
-    try { await rm(path, { recursive: true, force: true }); } catch (error) { cleanupFailures.push(error); }
+  for (const directory of [probeDirectory]) {
+    const childPath = relative(tempRoot, resolve(directory));
+    if (childPath === '' || childPath.startsWith('..') || isAbsolute(childPath)) { cleanupFailures.push(new Error('Refusing cleanup outside the test temporary root')); continue; }
+    try { await rm(directory, { recursive: true, force: true }); } catch (error) { cleanupFailures.push(error); }
   }
-  child.kill();
+  for (const connection of [...clients]) {
+    try { await connection.close(); } catch (error) { cleanupFailures.push(error); }
+  }
 }
-
-if (failure !== undefined) throw failure;
-if (cleanupFailures.length !== 0) throw new AggregateError(cleanupFailures, 'Live smoke cleanup failed');
+if (failure !== undefined || cleanupFailures.length) throw new AggregateError([...(failure ? [failure] : []), ...cleanupFailures], 'Live validation or cleanup failed');
 console.log(JSON.stringify(summary));
 
-async function createSession(label, agentPreset, model) {
-  if (testDirectory === undefined) throw new Error('Test directory is unavailable');
-  const sessionId = `session-mcp-smoke-${label}-${randomUUID()}`;
-  const created = await tool('dsh.session.create', { cwd: testDirectory, sessionId, agentPreset });
-  if (created.value.sessionId !== sessionId) throw new Error('DSH returned a different session ID');
+async function connect() {
+  const connection = new StdioClient(process.execPath, ['dist/server.js'], root);
+  clients.add(connection);
+  await connection.request('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'dsh-mcp-live-smoke', version: '1' } });
+  connection.notify('notifications/initialized');
+  return connection;
+}
+async function restart() { await client.close(); clients.delete(client); client = await connect(); }
+async function createSession(model) {
+  const result = await tool('dsh.session.create', { cwd: probeDirectory });
+  const sessionId = result.value.sessionId;
   createdSessions.push(sessionId);
-  if (model !== undefined) await tool('dsh.session.select_model', { sessionId, ...model });
+  if (result.value.cwd !== probeDirectory) throw new Error('DSH session uses another project');
+  const listed = await tool('dsh.session.list', { cwd: probeDirectory });
+  if (!listed.value.items.some((item) => item.sessionId === sessionId)) throw new Error('Created session is absent from its workspace');
+  if (model) await selectModel(sessionId, model);
   return sessionId;
 }
-
-async function waitTurn(turnRef, timeoutMs) {
-  return tool('dsh.session.wait_turn', { turnRef, timeoutMs });
+async function raw(endpoint, args) {
+  const result = await rpc.call(endpoint, args);
+  if (!result.ok) throw result.error;
+  return result.value;
 }
-
-function requireState(value, allowed, label) {
-  if (!allowed.includes(value.state)) throw new Error(`${label} ended in ${String(value.state)}: ${JSON.stringify(value.reason)}`);
+async function selectModel(sessionId, model) {
+  await tool('dsh.session.select_model', { sessionId, ...model });
+  const result = await tool('dsh.session.models', { sessionId });
+  if (result.value.selection.provider !== model.provider || result.value.selection.model !== model.model || result.value.selection.reasoningEffort !== (model.reasoningEffort ?? null)) throw new Error('The effective model selection does not match its receipt');
 }
-
-function requireInteraction(value, kind) {
-  requireState(value, ['input_required'], `${kind} turn`);
-  const interaction = value.pendingInteraction;
-  if (interaction?.kind !== kind || typeof interaction.pendingInteractionId !== 'string') throw new Error(`Missing ${kind} interaction: ${JSON.stringify(value)}`);
-  if (kind === 'question' && (!Array.isArray(interaction.questions) || interaction.questions.length === 0)) throw new Error('Question interaction has no questions');
-  return interaction;
-}
-
 async function tool(name, args) {
-  const result = await request('tools/call', { name, arguments: args });
-  if (result?.isError === true) throw new Error(`${name}: ${result.content?.[0]?.text ?? JSON.stringify(result.structuredContent)}`);
-  if (typeof result?.structuredContent !== 'object' || result.structuredContent === null) throw new Error(`${name} returned no structured content`);
-  return { value: result.structuredContent, text: Array.isArray(result.content) ? result.content.filter((item) => item?.type === 'text').map((item) => item.text).join('\n') : '' };
+  const result = await client.request('tools/call', { name, arguments: args });
+  if (result?.isError) throw new Error(name + ': ' + result.content?.[0]?.text);
+  if (!result?.structuredContent) throw new Error(name + ' returned no structured content');
+  const text = result.content.filter((item) => item.type === 'text').map((item) => item.text).join('\n');
+  // Generic hosts may expose only text blocks, so control metadata must remain visible.
+  const metadataText = result.content[0]?.text;
+  if (!metadataText?.includes(JSON.stringify(result.structuredContent))) throw new Error(name + ' omitted control metadata from text content');
+  return { value: result.structuredContent, text };
 }
-
-function request(method, params) {
-  const id = nextId++;
-  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-  return new Promise((resolveRequest, rejectRequest) => {
-    const timer = setTimeout(() => { pending.delete(id); rejectRequest(new Error(`MCP request timed out: ${method}`)); }, 200_000);
-    pending.set(id, { resolve: (value) => { clearTimeout(timer); resolveRequest(value); }, reject: (error) => { clearTimeout(timer); rejectRequest(error); } });
-  });
+async function waitTurn(turnRef) {
+  const deadline = Date.now() + 180_000;
+  do {
+    const result = await tool('dsh.session.wait_turn', { turnRef, timeoutMs: 30_000 });
+    if (result.value.state !== 'timed_out') return result;
+  } while (Date.now() < deadline);
+  throw new Error('DSH turn exceeded the live-test deadline: ' + turnRef);
 }
-
-function notify(method) { child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method })}\n`); }
-function consume(message) {
-  if (typeof message !== 'object' || message === null || !('id' in message)) return;
-  const waiter = pending.get(message.id);
-  if (waiter === undefined) return;
-  pending.delete(message.id);
-  if ('error' in message) waiter.reject(new Error(JSON.stringify(message.error))); else waiter.resolve(message.result);
+function requireState(value, allowed, label) {
+  if (!allowed.includes(value.state)) throw new Error(label + ' ended in ' + value.state + ': ' + JSON.stringify(value.reason));
 }
+function report(stage, value) { console.log(JSON.stringify({ stage, ...value })); }
 function delay(ms) { return new Promise((resolveDelay) => setTimeout(resolveDelay, ms)); }
-async function exists(path) { try { await access(path); return true; } catch (error) { if (error?.code === 'ENOENT') return false; throw error; } }
-function redact(value) { return value.replace(/(token=)[A-Za-z0-9_-]+/gi, '$1<redacted>'); }
+function sleepCommand(seconds) { return process.platform === 'win32' ? 'Start-Sleep -Seconds ' + seconds : 'sleep ' + seconds; }
+function shellQuote(value) { return "'" + value.replaceAll("'", "'\\''") + "'"; }

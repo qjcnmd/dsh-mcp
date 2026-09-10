@@ -11,7 +11,7 @@ import { projectToolResult } from '../../src/mcp/result-projection.js';
 import { createMcpServer } from '../../src/mcp/transport.js';
 import { DshEventClient } from '../../src/dsh/event-client.js';
 import { DshRpcClient } from '../../src/dsh/rpc-client.js';
-import { jsonResponse } from '../unit/fixtures.js';
+import { jsonResponse, testRuntime } from '../unit/fixtures.js';
 
 const config = loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' });
 
@@ -21,26 +21,31 @@ describe('foundation contracts', () => {
     expect(config.requestTimeoutMs).toBeGreaterThan(0);
   });
 
-  it('preserves structured values, emits concise text, and strips credential fields', () => {
+  it('preserves structured values for text-only clients and strips credential fields from both outputs', () => {
     const longText = 'x'.repeat(5_000);
     const result = projectToolResult({
       items: Array.from({ length: 25 }, (_, index) => ({ index })),
       longText,
       nested: { ok: true, token: 'secret-token', cookie: 'session-cookie' },
+      toolArguments: { raw: 'actual input', history: 3, events: ['click'] },
     }, 'Projected result.');
 
     expect(result.structuredContent).toEqual({
       items: Array.from({ length: 25 }, (_, index) => ({ index })),
       longText,
       nested: { ok: true },
+      toolArguments: { raw: 'actual input', history: 3, events: ['click'] },
     });
-    expect(result.content[0].text.length).toBeLessThan(500);
+    const text = result.content[0]!.text;
+    expect(JSON.parse(text.split('\n').slice(1).join('\n'))).toEqual(result.structuredContent);
+    expect(text).not.toContain('secret-token');
+    expect(text).not.toContain('session-cookie');
   });
 
   it('constructs one stable tool execution error', () => {
     expect(toolExecutionError('session-not-found', 'Missing session.', { sessionId: 'missing' })).toEqual({
       isError: true,
-      content: [{ type: 'text', text: 'Missing session.' }],
+      content: [{ type: 'text', text: expect.stringContaining('"sessionId":"missing"') }],
       structuredContent: {
         error: { code: 'session-not-found', message: 'Missing session.', target: { sessionId: 'missing' } },
       },
@@ -48,6 +53,7 @@ describe('foundation contracts', () => {
   });
 
   it('rejects conflicting token sources before connecting', () => {
+    expect(loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/?token=url-token', DSH_AUTH_TOKEN: ' ' }).authToken).toBe('url-token');
     expect(() => loadConfig({
       DSH_BASE_URL: 'http://127.0.0.1:3080/?token=url-token',
       DSH_AUTH_TOKEN: 'environment-token',
@@ -79,6 +85,27 @@ describe('foundation contracts', () => {
     expect(calls).toHaveLength(4);
     expect(calls.map((call) => call.cookie)).toEqual([null, 'dsh=session-1', null, 'dsh=session-2']);
     expect(calls.filter((call) => call.url.includes('token=launch-token'))).toHaveLength(2);
+  });
+
+  it('keeps shared authentication alive when one caller cancels', async () => {
+    let finishExchange: (response: Response) => void;
+    let exchanges = 0;
+    const auth = new DshAuthSession(loadConfig({ DSH_AUTH_TOKEN: 'test-token' }), async (_input, init) => {
+      exchanges += 1;
+      return new Promise((resolve, reject) => {
+        finishExchange = resolve;
+        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+      });
+    });
+    const controller = new AbortController();
+    const cancelled = auth.cookieHeader(controller.signal);
+    const other = auth.cookieHeader();
+    const rejection = expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+    controller.abort();
+    await rejection;
+    finishExchange!(new Response(null, { status: 303, headers: { 'set-cookie': 'dsh=shared; Path=/' } }));
+    expect(await other).toBe('dsh=shared');
+    expect(exchanges).toBe(1);
   });
 
   it.runIf(process.platform === 'win32')('discovers only the latest same-origin launcher token', async () => {
@@ -127,17 +154,39 @@ describe('foundation contracts', () => {
     await expect(transport.call('session/list', {})).rejects.toBeInstanceOf(DshTransportError);
   });
 
+  it.each(['cancel', 'timeout'] as const)('preserves %s while reading an HTTP response body', async (mode) => {
+    let readingStarted: () => void;
+    const reading = new Promise<void>((resolve) => { readingStarted = resolve; });
+    const controller = new AbortController();
+    const cancellation = new Error('Caller stopped reading');
+    const client = new DshRpcClient(loadConfig({ DSH_REQUEST_TIMEOUT_MS: '100' }), async (_input, init) => new Response(new ReadableStream({
+      pull(body) {
+        init!.signal!.addEventListener('abort', () => body.error(init!.signal!.reason), { once: true });
+        readingStarted();
+      },
+    }, { highWaterMark: 0 })));
+    const request = client.session.list(controller.signal);
+    const rejection = mode === 'cancel'
+      ? expect(request).rejects.toBe(cancellation)
+      : expect(request).rejects.toMatchObject({ code: 'transport-error', message: 'DSH request timed out' });
+    await reading;
+    if (mode === 'cancel') controller.abort(cancellation);
+    await rejection;
+  });
+
   it('does not read DSH until a caller explicitly subscribes', async () => {
     let calls = 0;
     const fetchImpl = async () => { calls += 1; return jsonResponse({}); };
-    const runtime = { config, rpc: new DshRpcClient(config, fetchImpl), events: new DshEventClient(config, fetchImpl) };
+    const runtime = testRuntime();
+    runtime.rpc = new DshRpcClient(config, fetchImpl);
+    runtime.events = new DshEventClient(config, fetchImpl);
     const server = createMcpServer(runtime);
     expect(calls).toBe(0);
     await server.close();
   });
 
   it('serves initialize and tools/list over the SDK transport', async () => {
-    const runtime = { config, rpc: new DshRpcClient(config, async () => jsonResponse({})), events: new DshEventClient(config, async () => jsonResponse({})) };
+    const runtime = testRuntime();
     const server = createMcpServer(runtime);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const messages: unknown[] = [];

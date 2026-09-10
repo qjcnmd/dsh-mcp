@@ -1,90 +1,63 @@
 # dsh-mcp
 
-`dsh-mcp` is a local, host-neutral MCP server for operating an already running
-DSH instance through DSH's structured HTTP and WebSocket interfaces.
+让Agent 通过 MCP 使用 [DSH](https://github.com/deepseek-ai/deepseek-harness)或者将DSH作为子代理
 
-The server is intentionally small. It exposes exactly these 19 tools:
+DSH 与 Agent 在同一项目中工作，会话使用内置的极简模式（`minimal`）和完全访问权限，执行 shell 命令时无需审批。新会话会自动配置，已有会话需要符合这些条件。
 
-| Area | Tools |
-|---|---|
-| Workspace | `dsh.workspace.list`, `dsh.session.archive` |
-| Session | `dsh.session.list`, `dsh.session.create`, `dsh.session.history` |
-| Model | `dsh.session.models`, `dsh.session.select_model` |
-| Turn | `dsh.session.send_message`, `dsh.session.wait_turn` |
-| Intervention | `dsh.session.cancel`, `dsh.session.respond_approval`, `dsh.session.answer_question` |
-| Command | `dsh.session.command`, `dsh.command.compact` |
-| Inspection | `dsh.session.snapshot`, `dsh.session.context_stats` |
-| Preset | `dsh.agent_preset.select` |
-| Context | `dsh.page.select_session`, `dsh.page.get_context` |
+## 安装与配置
 
-## Runtime contract
+需要 **Node.js 22+**、本机已启动的 DSH，以及支持 stdio 的 MCP 客户端。DSH版本：`0.1.5-rc.1`
 
-- DSH must already be running. The MCP server never starts, stops, or restarts it.
-- Mutating tools always require an explicit DSH target.
-- `dsh.session.wait_turn` waits on DSH events; it does not periodically query status.
-- DSH connections are opened only for an explicit tool call or an active turn wait.
-- List and history results are paged. Final responses are returned once, without
-  truncation, and results omit credentials, raw envelopes, and unrequested traces.
-- Pending approvals and questions retain their event listener until answered, withdrawn,
-  or disconnected, even after the wait returns.
-- One-shot snapshot reads use `DSH_REQUEST_TIMEOUT_MS`, including the opening baseline;
-  long-lived turn waits use their own deadline.
-- The context tools keep a read context inside the MCP process. They do not control a browser page.
-- `turnRef` values belong to the running MCP process. Send and wait for a turn through
-  the same process.
-
-## Core flow
-
-1. Find a target with `dsh.workspace.list` or `dsh.session.list`. Both return
-   `hasMore` and an opaque `nextCursor` when another page exists.
-2. Use `dsh.session.send_message`. The default mode is `steer`; pass `queue` to wait
-   behind an active turn.
-3. Pass the returned `turnRef` to `dsh.session.wait_turn`. It resolves on completion,
-   failure, cancellation, interruption, required input, timeout, or transport loss.
-4. If input is required, answer the exact interaction ID and wait on the same
-   `turnRef` again.
-
-`dsh.session.history` is an explicit compact read: it defaults to one recent turn,
-accepts at most five per page, and excludes reasoning, chunks, tool calls, and tool
-results. Tool execution failures use `isError: true` with a stable error code, message,
-and target.
-
-## Install and run
-
-Requires Node.js 20 or newer.
+从源码安装：
 
 ```sh
+git clone https://github.com/qjcnmd/dsh-mcp.git
+cd dsh-mcp
 npm ci
 npm run build
 ```
 
-Register `node <absolute-path>/dist/server.js` as a user-level stdio MCP server in
-the host. Configure the DSH endpoint through the process environment:
+在客户端的 MCP 配置中添加以下内容，将两个路径分别替换为本项目入口文件和你要操作的项目目录：
 
-```text
-DSH_BASE_URL=http://127.0.0.1:3080/
-DSH_AUTH_TOKEN=<launch-token-if-required>
+```json
+{
+  "mcpServers": {
+    "dsh": {
+      "command": "node",
+      "args": ["/absolute/path/to/dsh-mcp/dist/server.js", "/absolute/path/to/your-project"]
+    }
+  }
+}
 ```
 
-The launch token may instead be present as `?token=...` in `DSH_BASE_URL`; it is
-exchanged for DSH's authority-bound session cookie and is never returned by tools.
-When the Windows DeepSeek Harness launcher owns DSH and no token is configured, the
-server reads the latest same-origin launch URL from the launcher's bounded log tail.
+配置文件位置和外层字段以客户端要求为准。Windows 路径使用正斜杠 `/` 或转义后的反斜杠 `\\`。如果客户端会在当前项目目录启动 MCP，可以省略第二个路径。
 
-Optional settings:
+默认连接 `http://127.0.0.1:3080/`，需要时可在客户端的服务配置中设置以下环境变量：
 
-```text
-DSH_REQUEST_TIMEOUT_MS=30000
-DSH_STREAM_CONNECT_TIMEOUT_MS=10000
-DSH_MCP_LOG_LEVEL=info
-```
+| 变量 | 用途 |
+|---|---|
+| `DSH_BASE_URL` | DSH 地址，也可填写包含 `?token=...` 的启动链接 |
+| `DSH_AUTH_TOKEN` | 启动令牌；需要认证且地址中未包含令牌时填写 |
 
-## Development
+在 Windows 上，未提供令牌时，服务可从 DeepSeek Harness 启动器日志中读取与配置地址对应的令牌。
 
-```sh
-npm run typecheck
-npm test
-npm run build
-```
+## 使用
 
-The MCP wire protocol uses stdout. Diagnostics use stderr.
+Agent 可以创建或查找会话、发送指令并等待结果。等待超时不会停止 DSH，Agent 可以继续等待；MCP 重启后，只要 DSH 仍保留会话历史，也可以重新接管。
+
+## 工具
+
+| 工具 | 用途 |
+|---|---|
+| `dsh.session.list` | 查找当前项目中未归档的会话 |
+| `dsh.session.create` | 新建会话 |
+| `dsh.session.history` | 读取最近的消息和结果 |
+| `dsh.session.models` | 查询模型、思考程度及当前选择 |
+| `dsh.session.select_model` | 切换模型，可同时设置思考程度 |
+| `dsh.session.send_message` | 发送文字或图片，补充当前任务或排队执行 |
+| `dsh.session.wait_turn` | 等待结果或查看已有任务的进展 |
+| `dsh.session.cancel` | 取消正在执行的任务 |
+
+## 许可证
+
+[MIT](LICENSE)。

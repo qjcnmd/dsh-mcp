@@ -1,101 +1,146 @@
-export const TURN_STATES = [
-  'accepted', 'queued', 'running', 'pending-human-input', 'completed',
-  'failed', 'cancelled', 'interrupted', 'transport-lost', 'unknown',
-] as const;
+export const TURN_STATES = ['accepted', 'running', 'completed', 'failed', 'cancelled', 'interrupted', 'unknown'] as const;
 export type TurnState = (typeof TURN_STATES)[number];
-export type TerminalTurnState = Extract<TurnState, 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'transport-lost' | 'unknown'>;
-
-export interface TerminalReason {
-  kind: string;
-  code: string | null;
-  message: string | null;
-}
-
+export type TerminalTurnState = Extract<TurnState, 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'unknown'>;
+export interface TerminalReason { kind: string; code: string | null; message: string | null; }
 export interface TurnProjection {
   turnRef: string;
   sessionId: string;
   state: TurnState;
   reason: TerminalReason | null;
   finalAnswer: string | null;
-  pendingInteractionId: string | null;
-  observedAt: string;
+}
+export interface TurnRecord extends TurnProjection { sourceRef: string; }
+
+type State = Pick<TurnProjection, 'state' | 'reason' | 'finalAnswer'>;
+type Identity = { sessionId: string; sourceRef: string };
+interface Entry {
+  identity: Identity;
+  state: State;
+  refs: Set<string>;
+  waiters: number;
 }
 
-export interface TurnRecord extends TurnProjection {
-  sourceRef: string;
-}
+const MAX_COMPLETED_TURNS = 128;
 
 export function isTerminalState(state: TurnState): state is TerminalTurnState {
-  return state === 'completed' || state === 'failed' || state === 'cancelled' || state === 'interrupted' || state === 'transport-lost' || state === 'unknown';
+  return ['completed', 'failed', 'cancelled', 'interrupted', 'unknown'].includes(state);
 }
 
-const RANK: Record<TurnState, number> = { accepted: 0, queued: 1, running: 2, 'pending-human-input': 3, completed: 4, failed: 4, cancelled: 4, interrupted: 4, 'transport-lost': 4, unknown: 4 };
-
+/** Handles share one entry per DSH turn. Evicted completions can be restored from DSH. */
 export class TurnStore {
-  private readonly records = new Map<string, TurnRecord>();
-  private readonly openDshTurns = new Map<string, number>();
+  private readonly handles = new Map<string, Entry>();
+  private readonly completed = new Set<Entry>();
+  private readonly latestDshTurns = new Map<string, number>();
 
-  register(input: { sessionId: string; sourceRef: string; turnRef?: string }): TurnRecord {
-    const observedAt = new Date().toISOString();
-    const turnRef = input.turnRef ?? `turn_${crypto.randomUUID()}`;
-    const record: TurnRecord = { turnRef, sessionId: input.sessionId, sourceRef: input.sourceRef, state: 'accepted', reason: null, finalAnswer: null, pendingInteractionId: null, observedAt };
-    this.records.set(turnRef, record);
-    return { ...record };
+  register(input: Identity & { turnRef?: string }): TurnRecord {
+    const canonicalRef = encodeTurnRef(input);
+    const turnRef = input.turnRef ?? canonicalRef;
+    const entry: Entry = this.handles.get(canonicalRef) ?? {
+      identity: { sessionId: input.sessionId, sourceRef: input.sourceRef },
+      state: { state: 'accepted', reason: null, finalAnswer: null },
+      refs: new Set<string>(),
+      waiters: 0,
+    };
+    for (const ref of [canonicalRef, turnRef]) {
+      entry.refs.add(ref);
+      this.handles.set(ref, entry);
+    }
+    return this.record(turnRef, entry);
+  }
+
+  restore(turnRef: string): TurnRecord | undefined {
+    const existing = this.get(turnRef);
+    if (existing !== undefined) return existing;
+    if (!turnRef.startsWith('turn_')) return undefined;
+    try {
+      const value: unknown = JSON.parse(Buffer.from(turnRef.slice(5), 'base64url').toString('utf8'));
+      if (!Array.isArray(value) || value.length !== 2 || typeof value[0] !== 'string' || value[0] === '' || typeof value[1] !== 'string' || !/^(rpc:.+|dsh-turn:\d+)$/.test(value[1])) return undefined;
+      return this.register({ sessionId: value[0], sourceRef: value[1], turnRef });
+    } catch { return undefined; }
   }
 
   get(turnRef: string): TurnRecord | undefined {
-    const record = this.records.get(turnRef);
-    return record === undefined ? undefined : { ...record };
+    const entry = this.handles.get(turnRef);
+    return entry === undefined ? undefined : this.record(turnRef, entry);
   }
 
-  all(): TurnRecord[] {
-    return [...this.records.values()].map((record) => ({ ...record }));
+  /** Keep an observed turn available until its waiters have consumed the result. */
+  retain(turnRef: string): () => void {
+    this.entry(turnRef).waiters++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.entry(turnRef).waiters--;
+      this.prune();
+    };
   }
 
-  bindSource(turnRef: string, sourceRef: string): TurnRecord {
-    const current = this.records.get(turnRef);
-    if (current === undefined) throw new Error(`unknown turnRef: ${turnRef}`);
-    const updated = { ...current, sourceRef };
-    this.records.set(turnRef, updated);
-    return { ...updated };
+  observe(sessionId: string, fact: { turn: number; requestIds: string[]; state: TurnState; reason: TerminalReason | null; finalResponse: string | null }): TurnRecord {
+    this.latestDshTurns.set(sessionId, Math.max(this.latestDshTurns.get(sessionId) ?? fact.turn, fact.turn));
+    const record = this.register({ sessionId, sourceRef: 'dsh-turn:' + fact.turn });
+    const target = this.entry(record.turnRef);
+    for (const requestId of fact.requestIds) {
+      const source = this.handles.get(encodeTurnRef({ sessionId, sourceRef: 'rpc:' + requestId }));
+      if (source === undefined || source === target) continue;
+      for (const ref of source.refs) {
+        target.refs.add(ref);
+        this.handles.set(ref, target);
+      }
+      target.waiters += source.waiters;
+      this.completed.delete(source);
+    }
+    return this.transition(record.turnRef, { state: fact.state, reason: fact.reason, finalAnswer: fact.finalResponse });
   }
 
-  observeDshTurnStart(sessionId: string, turn: number): void {
-    this.openDshTurns.set(sessionId, turn);
-  }
-
-  bindRequestToOpenTurn(sessionId: string, requestId: string): TurnRecord | undefined {
-    const turn = this.openDshTurns.get(sessionId);
-    if (turn === undefined) return undefined;
-    const record = [...this.records.values()].find((candidate) => candidate.sessionId === sessionId && candidate.sourceRef === `rpc:${requestId}` && !isTerminalState(candidate.state));
-    if (record === undefined) return undefined;
-    return this.bindSource(record.turnRef, `dsh-turn:${turn}`);
-  }
-
-  findByDshTurn(sessionId: string, turn: number): TurnRecord[] {
-    const sourceRef = `dsh-turn:${turn}`;
-    return [...this.records.values()].filter((candidate) => candidate.sessionId === sessionId && candidate.sourceRef === sourceRef).map((record) => ({ ...record }));
+  latest(sessionId: string): TurnRecord | undefined {
+    const turn = this.latestDshTurns.get(sessionId);
+    return turn === undefined ? undefined : this.get(encodeTurnRef({ sessionId, sourceRef: 'dsh-turn:' + turn }));
   }
 
   reject(turnRef: string, reason: string): TurnRecord {
-    return this.transition(turnRef, { state: 'failed', reason: { kind: 'rejected', code: null, message: reason }, finalAnswer: null, pendingInteractionId: null });
+    return this.transition(turnRef, { state: 'failed', reason: { kind: 'rejected', code: null, message: reason }, finalAnswer: null });
   }
 
-  resolveInteraction(pendingInteractionId: string): TurnRecord | undefined {
-    const current = [...this.records.values()].find((record) => record.state === 'pending-human-input' && record.pendingInteractionId === pendingInteractionId);
-    if (current === undefined) return undefined;
-    const updated: TurnRecord = { ...current, state: 'running', reason: null, pendingInteractionId: null, observedAt: new Date().toISOString() };
-    this.records.set(updated.turnRef, updated);
-    return { ...updated };
+  accept(turnRef: string): void {
+    const entry = this.entry(turnRef);
+    if (entry.state.reason?.kind === 'rejected') {
+      entry.state = { state: 'accepted', reason: null, finalAnswer: null };
+      this.completed.delete(entry);
+    }
   }
 
-  transition(turnRef: string, next: Pick<TurnProjection, 'state' | 'reason' | 'finalAnswer' | 'pendingInteractionId'>): TurnRecord {
-    const current = this.records.get(turnRef);
-    if (current === undefined) throw new Error(`unknown turnRef: ${turnRef}`);
-    if (isTerminalState(current.state)) return { ...current };
-    if (RANK[next.state] < RANK[current.state]) return { ...current };
-    const updated: TurnRecord = { ...current, ...next, observedAt: new Date().toISOString() };
-    this.records.set(turnRef, updated);
-    return { ...updated };
+  transition(turnRef: string, next: State): TurnRecord {
+    const entry = this.entry(turnRef);
+    if (!isTerminalState(entry.state.state)) {
+      entry.state = { ...next };
+      if (isTerminalState(next.state)) this.completed.add(entry);
+    }
+    // Keep this result available to the caller even if all older entries are retained.
+    this.prune(entry);
+    return this.record(turnRef, entry);
   }
+
+  private prune(current?: Entry): void {
+    for (const entry of this.completed) {
+      if (this.completed.size <= MAX_COMPLETED_TURNS) break;
+      if (entry === current || entry.waiters !== 0) continue;
+      this.completed.delete(entry);
+      for (const ref of entry.refs) this.handles.delete(ref);
+      const { sessionId, sourceRef } = entry.identity;
+      if (sourceRef === 'dsh-turn:' + this.latestDshTurns.get(sessionId)) this.latestDshTurns.delete(sessionId);
+    }
+  }
+
+  private entry(turnRef: string): Entry {
+    const entry = this.handles.get(turnRef);
+    if (entry === undefined) throw new Error('unknown turnRef: ' + turnRef);
+    return entry;
+  }
+
+  private record(turnRef: string, entry: Entry): TurnRecord { return { turnRef, ...entry.identity, ...entry.state }; }
+}
+
+function encodeTurnRef(identity: Identity): string {
+  return 'turn_' + Buffer.from(JSON.stringify([identity.sessionId, identity.sourceRef])).toString('base64url');
 }

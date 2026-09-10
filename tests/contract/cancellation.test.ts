@@ -1,48 +1,50 @@
+import { testRuntime } from '../unit/fixtures.js';
 import { describe, expect, it } from 'vitest';
-import { loadConfig } from '../../src/config.js';
-import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
 import { TurnStore } from '../../src/domain/turns.js';
 import { waitForTurn } from '../../src/mcp/actions/turns.js';
-import type { DshEvent } from '../../src/dsh/event-client.js';
 
 describe('observation cancellation', () => {
-  it('releases MCP observation without invoking DSH cancellation', async () => {
+  it('releases active waits on MCP shutdown without cancelling DSH', async () => {
+    let stopped = 0;
+    let cancelled = 0;
+    const runtime = testRuntime({
+      events: { subscribeSession: () => () => { stopped += 1; } },
+      rpc: { session: { cancel: async () => { cancelled += 1; return { ok: true, value: { accepted: true } }; } } },
+    });
+    const turn = runtime.turns.register({ sessionId: 'running', sourceRef: 'rpc:running' });
+    const waiting = waitForTurn(runtime, turn.turnRef, 1_000, new AbortController().signal);
+    runtime.observations.watch('another', () => undefined);
+    runtime.observations.close();
+    expect((await waiting).structuredContent).toMatchObject({ state: 'transport_lost' });
+    expect(stopped).toBeGreaterThanOrEqual(2);
+    expect(cancelled).toBe(0);
+  });
+
+  it.each(['abort', 'timeout'])('releases observation and cached-turn retention on %s without cancelling DSH', async (outcome) => {
     let unsubscribeCalls = 0;
     let dshCancelCalls = 0;
-    const runtime = {
-      config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }),
+    const runtime = testRuntime({
       turns: new TurnStore(),
-      pending: new PendingInteractionStore(),
       rpc: { session: { cancel: async () => { dshCancelCalls += 1; return { ok: true, value: { accepted: true } }; } } },
       events: { subscribeSession: (_sessionId: string, _listener: unknown, _signal: AbortSignal) => { return () => { unsubscribeCalls += 1; }; } },
-    } as never;
+    });
     const record = runtime.turns.register({ sessionId: 'session-test', sourceRef: 'rpc:test' });
     const controller = new AbortController();
-    const promise = waitForTurn(runtime, record.turnRef, 10_000, controller.signal);
-    controller.abort();
-    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+    const promise = waitForTurn(runtime, record.turnRef, outcome === 'timeout' ? 10 : 10_000, controller.signal);
+    if (outcome === 'abort') {
+      controller.abort();
+      await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+    } else {
+      expect((await promise).structuredContent).toMatchObject({ state: 'timed_out' });
+    }
     expect(unsubscribeCalls).toBeGreaterThanOrEqual(1);
     expect(dshCancelCalls).toBe(0);
+    runtime.turns.observe('session-test', { turn: 1, requestIds: ['test'], state: 'completed', reason: null, finalResponse: 'finished after waiting stopped' });
+    for (let turn = 1; turn <= 200; turn++) {
+      runtime.turns.observe('other', { turn, requestIds: [], state: 'completed', reason: null, finalResponse: null });
+    }
+    expect(runtime.turns.get(record.turnRef)).toBeUndefined();
   });
 
-  it('resumes waiting with the same turnRef after required input is resolved', async () => {
-    let listener: ((event: DshEvent) => void) | undefined;
-    const turns = new TurnStore();
-    const pending = new PendingInteractionStore();
-    const runtime = {
-      config: loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' }), turns, pending,
-      rpc: {}, events: { subscribeSession: (_sessionId: string, next: (event: DshEvent) => void) => { listener = next; return () => undefined; } },
-    } as never;
-    const record = turns.register({ sessionId: 'session-test', sourceRef: 'dsh-turn:1' });
-    pending.upsert({ pendingInteractionId: 'question', sessionId: 'session-test', turnRef: record.turnRef, kind: 'question', prompt: 'Continue?', options: [], questions: [{ id: 'q', question: 'Continue?', options: [], multiSelect: false }] });
-    turns.transition(record.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'question' });
-    expect((await waitForTurn(runtime, record.turnRef, 100, new AbortController().signal)).structuredContent).toMatchObject({ state: 'input_required' });
 
-    turns.resolveInteraction('question');
-    pending.remove('question');
-    const resumed = waitForTurn(runtime, record.turnRef, 100, new AbortController().signal);
-    listener!({ stream: 'mux', rpcId: '', method: 'session/follow', payload: { type: 'session/event', sessionId: 'session-test', event: { type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, message: { content: [{ type: 'text', text: 'finished' }] } } } } });
-    listener!({ stream: 'mux', rpcId: '', method: 'session/follow', payload: { type: 'session/event', sessionId: 'session-test', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } } } });
-    expect(await resumed).toMatchObject({ structuredContent: { state: 'completed', turnRef: record.turnRef }, content: [{ type: 'text', text: 'finished' }] });
-  });
 });

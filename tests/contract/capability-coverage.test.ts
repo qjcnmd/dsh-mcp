@@ -1,210 +1,156 @@
-import { callMcpTool as callTool, mcpRequest } from '../unit/fixtures.js';
 import { describe, expect, it } from 'vitest';
-import { loadConfig } from '../../src/config.js';
-import { createRuntime } from '../../src/mcp/transport.js';
-import { PendingInteractionStore } from '../../src/domain/pending-interactions.js';
-import { TurnStore } from '../../src/domain/turns.js';
+import { join } from 'node:path';
+import type { DshSessionSummary } from '../../src/dsh/rpc-client.js';
+import { DshDomainError, DshMcpError } from '../../src/errors.js';
+import { callMcpTool, followSnapshot, mcpRequest, testRuntime } from '../unit/fixtures.js';
 
-const EXPECTED_TOOLS = [
-  'dsh.workspace.list',
-  'dsh.session.archive',
-  'dsh.session.list',
-  'dsh.session.create',
-  'dsh.session.history',
-  'dsh.session.models',
-  'dsh.session.select_model',
-  'dsh.session.send_message',
-  'dsh.session.wait_turn',
-  'dsh.session.cancel',
-  'dsh.session.respond_approval',
-  'dsh.session.answer_question',
-  'dsh.session.command',
-  'dsh.command.compact',
-  'dsh.session.snapshot',
-  'dsh.session.context_stats',
-  'dsh.agent_preset.select',
-  'dsh.page.select_session',
-  'dsh.page.get_context',
-] as const;
+const tools = ['list', 'create', 'models', 'select_model', 'send_message', 'wait_turn', 'cancel'].map((name) => 'dsh.session.' + name);
 
-describe('public tool surface', () => {
-  it('exposes exactly the selected compact tool set', async () => {
-    expect((await listTools()).map((tool) => tool.name)).toEqual(EXPECTED_TOOLS);
-  });
-
-  it('declares dedicated input and output shapes for every tool', async () => {
-    const inputs = [
-      ['query', 'limit', 'cursor'], ['sessionId'], ['workspaceId', 'status', 'query', 'limit', 'cursor'], ['workspaceId', 'cwd', 'sessionId', 'agentPreset'], ['sessionId', 'cursor', 'limit'], ['sessionId'], ['sessionId', 'provider', 'model', 'reasoningEffort'], ['sessionId', 'message', 'content', 'mode', 'clientTimeZone'], ['turnRef', 'timeoutMs'], ['sessionId'], ['sessionId', 'pendingInteractionId', 'outcome'], ['sessionId', 'pendingInteractionId', 'answers'], ['sessionId', 'command'], ['sessionId'], ['sessionId', 'recentEvents'], ['sessionId'], ['sessionId', 'agentPreset'], ['sessionId'], [],
-    ];
-    const outputs = [
-      ['items', 'hasMore', 'nextCursor'], ['sessionId', 'archived'], ['items', 'hasMore', 'nextCursor'], ['sessionId', 'agentPreset'], ['sessionId', 'turns', 'hasMore', 'nextCursor'], ['sessionId', 'selection', 'models'], ['sessionId', 'selected'], ['sessionId', 'turnRef', 'accepted', 'mode'], [], ['sessionId', 'cancellationRequested'], ['sessionId', 'pendingInteractionId', 'outcome', 'accepted'], ['sessionId', 'pendingInteractionId', 'accepted'], ['sessionId', 'command', 'status', 'message'], ['sessionId', 'compacted', 'message'], ['session', 'activeTurn', 'pendingInteractions', 'recentEvents', 'cursor'], ['sessionId', 'contextWindow', 'usedTokens', 'remainingTokens', 'usagePercent', 'asOfSeq'], ['sessionId', 'agentPreset'], ['selectedSessionId'], ['selectedSessionId', 'session', 'workspace'],
-    ];
-    const tools = await listTools();
-    for (const [index, tool] of tools.entries()) {
-      expect(Object.keys((tool.inputSchema as Record<string, unknown>).properties as object ?? {}), String(tool.name)).toEqual(inputs[index]);
-      expect(tool.outputSchema, String(tool.name)).toBeDefined();
-      const branches = (tool.outputSchema as { oneOf: Array<Record<string, unknown>> }).oneOf;
-      expect(branches).toHaveLength(2);
-      expect(Object.keys((branches[0]!.properties as object | undefined) ?? {}), String(tool.name)).toEqual(outputs[index]);
-      expect(Object.keys((branches[1]!.properties as object | undefined) ?? {})).toEqual(['error']);
+describe('minimal project tool surface', () => {
+  it('preserves domain error details consistently and adds each tool’s target identifiers', async () => {
+    const error = new DshDomainError('provider/unavailable', 'Provider unavailable', { provider: 'b-ai', retryable: true, sessionId: 'untrusted-target' });
+    const runtime = testRuntime({
+      rpc: { session: {
+        modelCatalog: async () => ({ ok: false, error }),
+        selectModel: async () => ({ ok: false, error }),
+        prompt: async () => ({ ok: false, error }),
+        cancel: async () => ({ ok: false, error }),
+      } },
+      events: { sessionSnapshot: async () => followSnapshot() },
+    });
+    for (const [name, args] of [
+      ['models', {}],
+      ['select_model', { sessionId: 'session', provider: 'b-ai', model: 'm' }],
+      ['send_message', { sessionId: 'session', requestId: 'request', message: 'go' }],
+      ['cancel', { sessionId: 'session' }],
+    ] as const) {
+      const result = await callMcpTool(runtime, 'dsh.session.' + name, args);
+      expect(result).toMatchObject({ isError: true, structuredContent: { error: { code: 'provider/unavailable', target: { provider: 'b-ai', retryable: 'true' } } } });
+      if (name !== 'models') {
+        expect(result.structuredContent).toMatchObject({ error: { target: { sessionId: 'session' } } });
+      }
+      if (name === 'send_message') {
+        expect(result.structuredContent).toMatchObject({ error: { target: { requestId: 'request', turnRef: expect.any(String) } } });
+      }
     }
-    const wait = ((tools[8]!.outputSchema as { oneOf: Array<{ oneOf?: unknown }> }).oneOf[0] as { oneOf: Array<{ properties: { state: { const?: string; enum?: string[] } } }> });
-    expect(wait.oneOf.flatMap((branch) => branch.properties.state.const ?? branch.properties.state.enum ?? [])).toEqual(['completed', 'failed', 'cancelled', 'interrupted', 'input_required', 'timed_out', 'transport_lost', 'unknown']);
-    const workspaceLimit = (((tools[0]!.inputSchema as Record<string, unknown>).properties as Record<string, Record<string, unknown>>).limit);
-    const historyLimit = (((tools[4]!.inputSchema as Record<string, unknown>).properties as Record<string, Record<string, unknown>>).limit);
-    expect(workspaceLimit).toMatchObject({ default: 20, minimum: 1, maximum: 100 });
-    expect(historyLimit).toMatchObject({ default: 1, minimum: 1, maximum: 5 });
   });
 
-  it('declares only steer and queue with steer as the send default', async () => {
-    const send = (await listTools()).find((tool) => tool.name === 'dsh.session.send_message');
-    const mode = ((send?.inputSchema as Record<string, unknown>).properties as Record<string, Record<string, unknown>>).mode;
-    expect(mode.enum).toEqual(['steer', 'queue']);
-    expect(mode.default).toBe('steer');
+  it('exposes seven project tools with portable output schemas and model efforts', async () => {
+    const result = await mcpRequest(testRuntime(), 'tools/list', {});
+    const listed = result.tools as Array<{ name: string; inputSchema: { properties: Record<string, unknown> }; outputSchema: { oneOf: unknown[] }; annotations: unknown }>;
+    expect(listed.map((tool) => tool.name)).toEqual(tools);
+    for (const tool of listed) {
+      expect(tool.outputSchema.oneOf).toHaveLength(2);
+      expect(tool.annotations).toBeDefined();
+    }
+    const input = (name: string) => listed.find((tool) => tool.name === 'dsh.session.' + name)!.inputSchema.properties;
+    expect(input('create').cwd).toMatchObject({ type: 'string' });
+    expect(input('list').limit).toMatchObject({ default: 20, maximum: 50 });
+    expect(input('select_model').reasoningEffort).toBeDefined();
+    expect(input('send_message').mode).toBeUndefined();
+    expect(input('send_message').content).toBeUndefined();
   });
 
-  it('pages and filters at least 100 session summaries without hidden truncation', async () => {
-    const workspaces = {
-      items: [
-        { workspaceId: 'w-a', title: 'Alpha', path: 'C:\\alpha', sessionIds: Array.from({ length: 51 }, (_, i) => `s-${String(i).padStart(3, '0')}`), createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' },
-        { workspaceId: 'w-b', title: 'Beta', path: 'C:\\beta', sessionIds: Array.from({ length: 50 }, (_, i) => `s-${String(i + 51).padStart(3, '0')}`), createdAt: '2026-01-03T00:00:00.000Z', updatedAt: '2026-01-04T00:00:00.000Z' },
-      ],
-      archivedSessionIds: ['s-100'],
-    };
-    const sessions = Array.from({ length: 101 }, (_, i) => ({ sessionId: `s-${String(i).padStart(3, '0')}`, updatedAt: Math.floor(i / 2), running: i % 2 === 0, blank: false, cwd: i === 88 ? 'C:\\needle-folder' : `C:\\work\\${i}`, projections: { asOfSeq: i, values: { title: i === 88 ? 'Needle title' : `Session ${i}`, agentPreset: 'simple', modelSelection: { next: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' }, lastUsed: null } } } }));
-    const runtime = collectionRuntime(sessions, workspaces);
-
-    const all = await callTool(runtime, 'dsh.session.list', { limit: 100 });
-    expect((all.structuredContent as { items: unknown[] }).items).toHaveLength(100);
-    expect(all.structuredContent).toMatchObject({ hasMore: false, nextCursor: null });
-    expect(JSON.stringify(all.structuredContent)).not.toContain('s-100');
-
-    const first = await callTool(runtime, 'dsh.session.list', { limit: 20 });
-    const cursor = (first.structuredContent as { nextCursor: string }).nextCursor;
-    const second = await callTool(runtime, 'dsh.session.list', { limit: 20, cursor });
-    const firstIds = (first.structuredContent as { items: Array<{ sessionId: string }> }).items.map((item) => item.sessionId);
-    const secondIds = (second.structuredContent as { items: Array<{ sessionId: string }> }).items.map((item) => item.sessionId);
-    expect(new Set([...firstIds, ...secondIds]).size).toBe(40);
-    expect(firstIds.slice(0, 2)).toEqual(['s-098', 's-099']);
-
-    const filtered = await callTool(runtime, 'dsh.session.list', { workspaceId: 'w-b', status: 'running', query: 'needle', limit: 20 });
-    expect(filtered.structuredContent).toMatchObject({ items: [{ sessionId: 's-088', workspaceTitle: 'Beta', status: 'running' }], hasMore: false });
-
-    const wrongFilter = await callTool(runtime, 'dsh.session.list', { query: 'changed', cursor });
-    expect(wrongFilter).toMatchObject({ isError: true, structuredContent: { error: { code: 'invalid-cursor' } } });
-    sessions[99]!.updatedAt += 10;
-    const stale = await callTool(runtime, 'dsh.session.list', { limit: 20, cursor });
-    expect(stale).toMatchObject({ isError: true, structuredContent: { error: { code: 'stale-cursor' } } });
+  it('pages through the current project and explains unsupported presets', async () => {
+    const sessions: DshSessionSummary[] = Array.from({ length: 105 }, (_, index) => ({
+      sessionId: 'session-' + index, updatedAt: Math.floor(index / 2), running: false, blank: true,
+      cwd: process.cwd(), projections: followSnapshot().projections,
+    }));
+    sessions.push(
+      { sessionId: 'another-project', updatedAt: 999, running: false, blank: true, cwd: join(process.cwd(), '..') },
+      { sessionId: 'child', parentSessionId: 'session-1', updatedAt: 998, running: true, blank: false, cwd: process.cwd() },
+      { sessionId: 'standard', updatedAt: 997, running: false, blank: true, cwd: process.cwd(), projections: followSnapshot([], { projections: { asOfSeq: 0, values: { agentPreset: 'standard' } } }).projections },
+    );
+    const runtime = testRuntime({
+      rpc: { session: { list: async () => ({ ok: true, value: { items: sessions } }) } },
+      events: { archivedSessionIds: async () => ['session-0'] },
+    });
+    const result = await callMcpTool(runtime, 'dsh.session.list', { cwd: process.cwd() });
+    type Page = { cwd: string; items: Array<{ sessionId: string; unsupportedReason: string | null }>; hasMore: boolean; nextCursor: string | null };
+    const value = result.structuredContent as Page;
+    expect(value.cwd).toBe(process.cwd());
+    expect(value.items).toHaveLength(20);
+    expect(value.items[0]).toMatchObject({ sessionId: 'standard', unsupportedReason: expect.stringContaining('minimal') });
+    expect(value.items.slice(1).every((item) => item.unsupportedReason === null)).toBe(true);
+    const all = [...value.items];
+    let cursor = value.nextCursor;
+    expect(value.hasMore).toBe(true);
+    sessions.push({ sessionId: 'newer', updatedAt: 1000, running: false, blank: true, cwd: process.cwd(), projections: followSnapshot().projections });
+    while (cursor !== null) {
+      const page = (await callMcpTool(runtime, 'dsh.session.list', { cwd: process.cwd(), cursor, limit: 50 })).structuredContent as Page;
+      all.push(...page.items);
+      expect(page.hasMore).toBe(page.nextCursor !== null);
+      cursor = page.nextCursor;
+    }
+    expect(all).toHaveLength(105);
+    expect(new Set(all.map((item) => item.sessionId)).size).toBe(105);
+    expect(all.some((item) => ['another-project', 'child', 'session-0', 'newer'].includes(item.sessionId))).toBe(false);
+    expect(await callMcpTool(runtime, 'dsh.session.list', { cwd: process.cwd(), cursor: 'invalid' })).toMatchObject({ isError: true, structuredContent: { error: { code: 'invalid-cursor' } } });
+    const otherDirectory = join(process.cwd(), '..');
+    expect((await callMcpTool(runtime, 'dsh.session.list', { cwd: otherDirectory })).structuredContent).toMatchObject({ cwd: otherDirectory, items: [{ sessionId: 'another-project' }] });
+    expect(await callMcpTool(runtime, 'dsh.session.list', { cwd: otherDirectory, cursor: value.nextCursor })).toMatchObject({ isError: true, structuredContent: { error: { code: 'invalid-cursor' } } });
   });
 
-  it('returns compact workspace pages in DSH registry order', async () => {
-    const workspaces = { items: [
-      { workspaceId: 'w-z', title: 'Zeta', path: 'C:\\zeta', sessionIds: ['active', 'archived'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' },
-      { workspaceId: 'w-a', title: 'Alpha', path: 'C:\\alpha', sessionIds: [], createdAt: '2026-01-03T00:00:00.000Z', updatedAt: '2026-01-04T00:00:00.000Z' },
-    ], archivedSessionIds: ['archived'] };
-    const runtime = collectionRuntime([], workspaces);
-    const result = await callTool(runtime, 'dsh.workspace.list', { limit: 1 });
-    expect(result.structuredContent).toMatchObject({ items: [{ workspaceId: 'w-z', sessionCount: 1 }], hasMore: true });
-    expect(JSON.stringify(result.structuredContent)).not.toContain('sessionIds');
-  });
-
-  it('returns exact configuration receipts without activating a cold session', async () => {
-    let activated = 0;
-    const turns = new TurnStore();
-    const active = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:test' });
-    turns.transition(active.turnRef, { state: 'running', reason: null, finalAnswer: null, pendingInteractionId: null });
-    const runtime = {
-      turns,
-      pending: new PendingInteractionStore(),
-      selectedSessionId: null,
+  it('creates minimal in the requested directory, then sets and verifies full access', async () => {
+    const calls: unknown[] = [];
+    const runtime = testRuntime({
       rpc: {
-        session: {
-          list: async () => ({ ok: true, value: { items: [{ sessionId: 'session-test', updatedAt: 1, running: false, blank: true, projections: { asOfSeq: 1, values: { modelSelection: { lastUsed: null, next: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' } } } } }] } }),
-          modelCatalog: async () => ({ ok: true, value: { default: { provider: 'b-ai', model: 'default' }, routableProviders: ['b-ai'], failures: [], groups: [{ id: 'b-ai', name: 'B.AI', models: [{ id: 'qwen3.8-flash', name: 'Qwen 3.8 Flash', reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] } }),
-          selectModel: async () => ({ ok: true, value: { selected: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' } } }),
-          create: async () => ({ ok: true, value: { sessionId: 'created', agentPreset: 'simple' } }),
-          cancel: async () => ({ ok: true, value: { accepted: true } }),
-        },
-        workspace: { archiveSession: async () => ({ ok: true, value: { archivedSessionIds: ['session-test'] } }) },
-        agentPresets: { select: async () => ({ ok: true, value: 'simple' }) },
+        session: { create: async (request) => { calls.push(request); return { ok: true, value: { sessionId: 'new' } }; } },
+        setFullAccess: async (sessionId) => { calls.push(['permission', sessionId]); },
       },
-      events: { subscribeSession: () => { activated += 1; return () => undefined; }, sessionSnapshot: async () => { activated += 1; throw new Error('not expected'); } },
-    } as never;
-
-    expect((await callTool(runtime, 'dsh.session.models', { sessionId: 'session-test' })).structuredContent).toEqual({ sessionId: 'session-test', selection: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' }, models: [{ provider: 'b-ai', model: 'qwen3.8-flash', label: 'Qwen 3.8 Flash', reasoningEfforts: ['high'] }] });
-    expect(activated).toBe(0);
-    expect((await callTool(runtime, 'dsh.session.select_model', { sessionId: 'session-test', provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' })).structuredContent).toEqual({ sessionId: 'session-test', selected: { provider: 'b-ai', model: 'qwen3.8-flash', reasoningEffort: 'high' } });
-    expect((await callTool(runtime, 'dsh.session.create', { cwd: 'C:\\temp', agentPreset: 'simple' })).structuredContent).toEqual({ sessionId: 'created', agentPreset: 'simple' });
-    expect((await callTool(runtime, 'dsh.agent_preset.select', { sessionId: 'session-test', agentPreset: 'simple' })).structuredContent).toEqual({ sessionId: 'session-test', agentPreset: 'simple' });
-    expect((await callTool(runtime, 'dsh.session.cancel', { sessionId: 'session-test' })).structuredContent).toEqual({ sessionId: 'session-test', cancellationRequested: true });
-    expect((await callTool(runtime, 'dsh.session.archive', { sessionId: 'session-test' })).structuredContent).toEqual({ sessionId: 'session-test', archived: true });
-    expect(turns.get(active.turnRef)?.state).toBe('running');
+      events: { sessionSnapshot: async (sessionId) => { calls.push(['verify', sessionId]); return followSnapshot(); } },
+    });
+    const cwd = join(process.cwd(), '..');
+    expect((await callMcpTool(runtime, 'dsh.session.create', { cwd })).structuredContent).toEqual({ sessionId: 'new', cwd });
+    expect(calls).toEqual([{ cwd, agentPreset: 'minimal' }, ['permission', 'new'], ['verify', 'new']]);
+    runtime.rpc.setFullAccess = async () => { throw new Error('permission unavailable'); };
+    expect(await callMcpTool(runtime, 'dsh.session.create', { cwd })).toMatchObject({ isError: true, structuredContent: { error: { code: 'session-setup-failed', target: { sessionId: 'new' } } } });
   });
 
-  it('returns content-free snapshots, normalized context statistics, and compact selected context', async () => {
-    const turns = new TurnStore();
-    const active = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:test' });
-    turns.transition(active.turnRef, { state: 'running', reason: null, finalAnswer: 'must not leak', pendingInteractionId: null });
-    const workspaces = { items: [{ workspaceId: 'w', title: 'Workspace', path: 'C:\\work', sessionIds: ['session-test'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z' }], archivedSessionIds: [] };
-    const rawSession = { sessionId: 'session-test', updatedAt: 10, running: true, blank: false, cwd: 'C:\\work', projections: { asOfSeq: 9, values: { title: 'Session', agentPreset: 'simple', contextPressure: { pressureTokens: 25, contextWindow: 100 } } } };
-    const runtime = {
-      turns, pending: new PendingInteractionStore(), selectedSessionId: null,
-      rpc: { session: { list: async () => ({ ok: true, value: { items: [rawSession] } }) } },
-      events: { workspaceSnapshot: async () => workspaces, sessionSnapshot: async () => ({ cursor: 9, hasMore: false, header: {}, records: [{ type: 'event', event: { seq: 8, time: 80, type: 'assistant/message', surfaceOp: 'append', data: { turn: 2, message: { content: [{ type: 'text', text: 'conversation must not leak' }] } } } }], projections: { asOfSeq: 9, values: rawSession.projections.values } }) },
-    } as never;
-
-    const snapshot = await callTool(runtime, 'dsh.session.snapshot', { sessionId: 'session-test', recentEvents: 5 });
-    expect(snapshot.structuredContent).toMatchObject({ session: { sessionId: 'session-test', workspaceId: 'w', title: 'Session', status: 'running' }, activeTurn: { turnRef: active.turnRef, state: 'running' }, recentEvents: [{ seq: 8, type: 'assistant/message', time: 80, turn: 2 }], cursor: 9 });
-    expect(JSON.stringify(snapshot.structuredContent)).not.toContain('must not leak');
-    expect((await callTool(runtime, 'dsh.session.context_stats', { sessionId: 'session-test' })).structuredContent).toEqual({ sessionId: 'session-test', contextWindow: 100, usedTokens: 25, remainingTokens: 75, usagePercent: 25, asOfSeq: 9 });
-    expect((await callTool(runtime, 'dsh.page.get_context', {})).structuredContent).toEqual({ selectedSessionId: null, session: null, workspace: null });
-    expect((await callTool(runtime, 'dsh.page.select_session', { sessionId: 'session-test' })).structuredContent).toEqual({ selectedSessionId: 'session-test' });
-    const context = await callTool(runtime, 'dsh.page.get_context', {});
-    expect(context.structuredContent).toMatchObject({ selectedSessionId: 'session-test', session: { sessionId: 'session-test', title: 'Session' }, workspace: { workspaceId: 'w', sessionCount: 1 } });
-    expect(JSON.stringify(context.structuredContent)).not.toContain('sessionIds');
+  it('requires an absolute workspace and rejects a file before creating a session', async () => {
+    const runtime = testRuntime();
+    for (const name of ['list', 'create']) {
+      for (const args of [{}, { cwd: '.' }]) {
+        expect(await callMcpTool(runtime, 'dsh.session.' + name, args)).toMatchObject({ isError: true });
+      }
+    }
+    expect(await callMcpTool(runtime, 'dsh.session.create', { cwd: join(process.cwd(), 'package.json') })).toMatchObject({ isError: true, structuredContent: { error: { code: 'invalid-directory' } } });
   });
 
-  it('responds to exact pending interaction identities once', async () => {
-    const turns = new TurnStore();
-    const pending = new PendingInteractionStore();
-    const approvalTurn = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:approval' });
-    turns.transition(approvalTurn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'approval' });
-    pending.upsert({ pendingInteractionId: 'approval', sessionId: 'session-test', turnRef: approvalTurn.turnRef, kind: 'approval', prompt: 'Allow shell?', options: [{ label: 'allowed-once' }, { label: 'rejected' }] });
-    const values: unknown[] = [];
-    const runtime = {
-      turns, pending, selectedSessionId: null, rpc: {},
-      events: { respondRemoteInteraction: async (_id: string, value: unknown) => { values.push(value); return { ok: true, value: undefined }; } },
-    } as never;
-    expect((await callTool(runtime, 'dsh.session.respond_approval', { sessionId: 'other', pendingInteractionId: 'approval', outcome: 'allowed-once' }))).toMatchObject({ isError: true, structuredContent: { error: { code: 'pending-interaction-mismatch' } } });
-    const approval = await callTool(runtime, 'dsh.session.respond_approval', { sessionId: 'session-test', pendingInteractionId: 'approval', outcome: 'allowed-once' });
-    expect(approval.structuredContent).toEqual({ sessionId: 'session-test', pendingInteractionId: 'approval', outcome: 'allowed-once', accepted: true });
-    expect(turns.get(approvalTurn.turnRef)?.state).toBe('running');
-    expect((await callTool(runtime, 'dsh.session.respond_approval', { sessionId: 'session-test', pendingInteractionId: 'approval', outcome: 'rejected' }))).toMatchObject({ isError: true, structuredContent: { error: { code: 'pending-interaction-not-found' } } });
+  it('does not mutate an unsupported existing session', async () => {
+    let writes = 0;
+    const runtime = testRuntime({
+      rpc: { session: {
+        prompt: async () => { writes++; return { ok: true, value: { accepted: true } }; },
+        cancel: async () => { writes++; return { ok: true, value: { accepted: true } }; },
+        selectModel: async () => { writes++; return { ok: true, value: { selected: { provider: 'b-ai', model: 'm' } } }; },
+      } },
+      events: { sessionSnapshot: async () => { throw new DshMcpError('unsupported-session', 'Unsupported preset'); } },
+    });
+    for (const [name, args] of [
+      ['send_message', { sessionId: 'other', message: 'go' }],
+      ['cancel', { sessionId: 'other' }],
+      ['select_model', { sessionId: 'other', provider: 'b-ai', model: 'm' }],
+    ] as const) expect(await callMcpTool(runtime, 'dsh.session.' + name, args)).toMatchObject({ isError: true, structuredContent: { error: { code: 'unsupported-session' } } });
+    expect(writes).toBe(0);
+  });
 
-    const questionTurn = turns.register({ sessionId: 'session-test', sourceRef: 'rpc:question' });
-    turns.transition(questionTurn.turnRef, { state: 'pending-human-input', reason: null, finalAnswer: null, pendingInteractionId: 'question' });
-    pending.upsert({ pendingInteractionId: 'question', sessionId: 'session-test', turnRef: questionTurn.turnRef, kind: 'question', prompt: 'Choose', options: [], questions: [{ id: 'q', question: 'Choose', options: [{ label: 'yes' }], multiSelect: false }] });
-    const answer = await callTool(runtime, 'dsh.session.answer_question', { sessionId: 'session-test', pendingInteractionId: 'question', answers: [{ id: 'q', selected: ['yes'] }] });
-    expect(answer.structuredContent).toEqual({ sessionId: 'session-test', pendingInteractionId: 'question', accepted: true });
-    expect(values).toEqual(['allowed-once', { answers: [{ id: 'q', selected: ['yes'] }] }]);
+  it('returns model efforts, defaults, provider failures and the effective session selection', async () => {
+    const runtime = testRuntime({
+      rpc: { session: {
+        modelCatalog: async () => ({ ok: true, value: {
+          default: { provider: 'b-ai', model: 'm', reasoningEffort: 'low' }, routableProviders: ['b-ai'],
+          failures: [{ id: 'down', name: 'Unavailable provider', message: 'offline' }],
+          groups: [{ id: 'b-ai', models: [{ id: 'm', name: 'Model', reasoning: { efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'low' } }] }],
+        } }),
+        selectModel: async (request) => ({ ok: true, value: { selected: request } }),
+      } },
+      events: { sessionSnapshot: async () => followSnapshot([], { projections: { asOfSeq: 0, values: { modelSelection: { next: { provider: 'b-ai', model: 'm', reasoningEffort: 'high' } } } } }) },
+    });
+    const catalog = await callMcpTool(runtime, 'dsh.session.models', {});
+    expect(catalog.structuredContent).toMatchObject({ selectionSource: 'default', selection: { reasoningEffort: 'low' }, models: [{ reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'low' }], failures: [{ message: 'offline' }] });
+    const session = await callMcpTool(runtime, 'dsh.session.models', { sessionId: 'existing' });
+    expect(session.structuredContent).toMatchObject({ selectionSource: 'session', selection: { reasoningEffort: 'high' } });
+    expect((await callMcpTool(runtime, 'dsh.session.select_model', { sessionId: 'existing', provider: 'b-ai', model: 'm', reasoningEffort: 'low' })).structuredContent).toMatchObject({ selected: { reasoningEffort: 'low' } });
   });
 });
-
-async function listTools(): Promise<Array<Record<string, unknown>>> {
-  const result = await mcpRequest(createRuntime(loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' })), 'tools/list', {});
-  return Array.isArray(result.tools) ? result.tools.filter(isRecord) : [];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function collectionRuntime(sessions: unknown[], workspaces: unknown) {
-  return {
-    rpc: { session: { list: async () => ({ ok: true, value: { items: sessions } }) } },
-    events: { workspaceSnapshot: async () => workspaces },
-    turns: new TurnStore(),
-    pending: new PendingInteractionStore(),
-    selectedSessionId: null,
-  } as never;
-}

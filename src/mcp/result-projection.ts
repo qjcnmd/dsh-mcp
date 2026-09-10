@@ -1,22 +1,23 @@
 const OMIT_KEYS = new Set([
-  'raw', 'envelope', 'history', 'events', 'trace', 'traces', 'credentials',
+  'credentials',
   'secret', 'token', 'apikey', 'password', 'authorization', 'cookie',
   'privatekey', 'secretkey', 'accesstoken', 'refreshtoken',
 ]);
 
-export interface ProjectedToolResult {
+export interface ProjectedToolResult<T extends Record<string, unknown> = Record<string, unknown>> {
   [key: string]: unknown;
-  content: [{ type: 'text'; text: string }];
-  structuredContent: Record<string, unknown>;
+  content: Array<{ type: 'text'; text: string }>;
+  structuredContent: T;
 }
 
-export function projectToolResult(
-  value: object,
+export function projectToolResult<const T extends Record<string, unknown>>(
+  value: T,
   summary: string,
-): ProjectedToolResult {
+): ProjectedToolResult<T> {
+  const structuredContent = redactCredentialFields(value) as T;
   return {
-    content: [{ type: 'text', text: summary }],
-    structuredContent: redactCredentialFields(value) as Record<string, unknown>,
+    content: [{ type: 'text', text: `${summary}\n${JSON.stringify(structuredContent)}` }],
+    structuredContent,
   };
 }
 

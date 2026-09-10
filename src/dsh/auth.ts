@@ -22,9 +22,7 @@ export class DshAuthSession {
     if (cookie !== undefined) headers.set('cookie', cookie);
     let response = await this.fetchImpl(input, { ...init, headers });
     if (response.status !== 401) return response;
-    this.cookie = undefined;
-    this.discoveredToken = undefined;
-    const refreshed = await this.cookieHeader(init.signal ?? undefined);
+    const refreshed = await this.refreshCookie(init.signal ?? undefined);
     if (refreshed === undefined) return response;
     const retryHeaders = new Headers(init.headers);
     retryHeaders.set('cookie', refreshed);
@@ -33,12 +31,26 @@ export class DshAuthSession {
   }
 
   async cookieHeader(signal?: AbortSignal): Promise<string | undefined> {
+    signal?.throwIfAborted();
     if (this.cookie !== undefined) return this.cookie;
     const token = this.config.authToken ?? this.discoveredToken ?? (this.discoverLauncherAuth ? await discoverLauncherToken(this.config) : undefined);
     if (token === undefined) return undefined;
     if (this.config.authToken === undefined) this.discoveredToken = token;
-    this.exchange ??= this.exchangeToken(token, signal).finally(() => { this.exchange = undefined; });
-    return this.exchange;
+    // Authentication is shared; one cancelled reader must not cancel other readers.
+    this.exchange ??= this.exchangeToken(token, AbortSignal.timeout(this.config.requestTimeoutMs)).finally(() => { this.exchange = undefined; });
+    if (signal === undefined) return this.exchange;
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(signal.reason);
+      signal.addEventListener('abort', abort, { once: true });
+      this.exchange!.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+      if (signal.aborted) abort();
+    });
+  }
+
+  async refreshCookie(signal?: AbortSignal): Promise<string | undefined> {
+    this.cookie = undefined;
+    this.discoveredToken = undefined;
+    return this.cookieHeader(signal);
   }
 
   private async exchangeToken(token: string, signal?: AbortSignal): Promise<string> {
