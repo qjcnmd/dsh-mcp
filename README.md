@@ -1,8 +1,8 @@
 # dsh-mcp
 
-让Agent 通过 MCP 使用 [DSH](https://github.com/deepseek-ai/deepseek-harness)或者将DSH作为子代理
+让 Agent 通过 MCP 使用 [DSH](https://github.com/deepseek-ai/deepseek-harness)，或将 DSH 作为子代理。
 
-DSH 与 Agent 在同一项目中工作，会话使用内置的极简模式（`minimal`）和完全访问权限，执行 shell 命令时无需审批。新会话会自动配置，已有会话需要符合这些条件。
+创建或查找会话时，Agent 通过 `cwd` 指定项目的绝对路径，同一个 MCP 服务可以操作不同项目。会话使用内置的极简模式（`minimal`）和完全访问权限，执行 shell 命令时无需审批。新会话会自动配置，已有会话需要符合这些条件。
 
 ## 安装与配置
 
@@ -17,20 +17,20 @@ npm ci
 npm run build
 ```
 
-在客户端的 MCP 配置中添加以下内容，将两个路径分别替换为本项目入口文件和你要操作的项目目录：
+在客户端的 MCP 配置中添加以下内容，将路径替换为本项目的入口文件：
 
 ```json
 {
   "mcpServers": {
     "dsh": {
       "command": "node",
-      "args": ["/absolute/path/to/dsh-mcp/dist/server.js", "/absolute/path/to/your-project"]
+      "args": ["/absolute/path/to/dsh-mcp/dist/server.js"]
     }
   }
 }
 ```
 
-配置文件位置和外层字段以客户端要求为准。Windows 路径使用正斜杠 `/` 或转义后的反斜杠 `\\`。如果客户端会在当前项目目录启动 MCP，可以省略第二个路径。
+配置文件位置和外层字段以客户端要求为准。Windows 路径使用正斜杠 `/` 或转义后的反斜杠 `\\`。项目路径通过 `dsh.session.create` 和 `dsh.session.list` 的 `cwd` 参数传入，例如 `{"cwd":"C:/Users/you/project"}`。
 
 默认连接 `http://127.0.0.1:3080/`，需要时可在客户端的服务配置中设置以下环境变量：
 
@@ -49,12 +49,11 @@ Agent 可以创建或查找会话、发送指令并等待结果。等待超时�
 
 | 工具 | 用途 |
 |---|---|
-| `dsh.session.list` | 查找当前项目中未归档的会话 |
-| `dsh.session.create` | 新建会话 |
-| `dsh.session.history` | 读取最近的消息和结果 |
+| `dsh.session.list` | 查找指定 `cwd` 中未归档的顶层会话 |
+| `dsh.session.create` | 在指定 `cwd` 中新建会话 |
 | `dsh.session.models` | 查询模型、思考程度及当前选择 |
 | `dsh.session.select_model` | 切换模型，可同时设置思考程度 |
-| `dsh.session.send_message` | 发送文字或图片，补充当前任务或排队执行 |
+| `dsh.session.send_message` | 发送文字指令；空闲时开始任务，执行中补充当前任务。可在文字中引用共享文件路径 |
 | `dsh.session.wait_turn` | 等待结果或查看已有任务的进展 |
 | `dsh.session.cancel` | 取消正在执行的任务 |
 

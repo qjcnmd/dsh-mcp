@@ -1,6 +1,8 @@
-export const TURN_STATES = ['accepted', 'running', 'completed', 'failed', 'cancelled', 'interrupted', 'unknown'] as const;
+export const ACTIVE_TURN_STATES = ['accepted', 'running'] as const;
+export const TERMINAL_TURN_STATES = ['completed', 'failed', 'cancelled', 'interrupted', 'unknown'] as const;
+export const TURN_STATES = [...ACTIVE_TURN_STATES, ...TERMINAL_TURN_STATES] as const;
 export type TurnState = (typeof TURN_STATES)[number];
-export type TerminalTurnState = Extract<TurnState, 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'unknown'>;
+export type TerminalTurnState = (typeof TERMINAL_TURN_STATES)[number];
 export interface TerminalReason { kind: string; code: string | null; message: string | null; }
 export interface TurnProjection {
   turnRef: string;
@@ -17,19 +19,19 @@ interface Entry {
   identity: Identity;
   state: State;
   refs: Set<string>;
-  waiters: number;
+  retainCount: number;
 }
 
-const MAX_COMPLETED_TURNS = 128;
+const MAX_CACHED_TURNS = 128;
 
 export function isTerminalState(state: TurnState): state is TerminalTurnState {
-  return ['completed', 'failed', 'cancelled', 'interrupted', 'unknown'].includes(state);
+  return TERMINAL_TURN_STATES.some((terminal) => terminal === state);
 }
 
-/** Handles share one entry per DSH turn. Evicted completions can be restored from DSH. */
+/** Handles share one entry per DSH turn. Evicted entries can be restored from DSH. */
 export class TurnStore {
   private readonly handles = new Map<string, Entry>();
-  private readonly completed = new Set<Entry>();
+  private readonly entries = new Set<Entry>();
   private readonly latestDshTurns = new Map<string, number>();
 
   register(input: Identity & { turnRef?: string }): TurnRecord {
@@ -39,12 +41,14 @@ export class TurnStore {
       identity: { sessionId: input.sessionId, sourceRef: input.sourceRef },
       state: { state: 'accepted', reason: null, finalAnswer: null },
       refs: new Set<string>(),
-      waiters: 0,
+      retainCount: 0,
     };
     for (const ref of [canonicalRef, turnRef]) {
       entry.refs.add(ref);
       this.handles.set(ref, entry);
     }
+    this.entries.add(entry);
+    this.prune(entry);
     return this.record(turnRef, entry);
   }
 
@@ -64,14 +68,14 @@ export class TurnStore {
     return entry === undefined ? undefined : this.record(turnRef, entry);
   }
 
-  /** Keep an observed turn available until its waiters have consumed the result. */
+  /** Keep a turn available while a submission or waiter is using it. */
   retain(turnRef: string): () => void {
-    this.entry(turnRef).waiters++;
+    this.entry(turnRef).retainCount++;
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.entry(turnRef).waiters--;
+      this.entry(turnRef).retainCount--;
       this.prune();
     };
   }
@@ -87,8 +91,8 @@ export class TurnStore {
         target.refs.add(ref);
         this.handles.set(ref, target);
       }
-      target.waiters += source.waiters;
-      this.completed.delete(source);
+      target.retainCount += source.retainCount;
+      this.entries.delete(source);
     }
     return this.transition(record.turnRef, { state: fact.state, reason: fact.reason, finalAnswer: fact.finalResponse });
   }
@@ -106,7 +110,6 @@ export class TurnStore {
     const entry = this.entry(turnRef);
     if (entry.state.reason?.kind === 'rejected') {
       entry.state = { state: 'accepted', reason: null, finalAnswer: null };
-      this.completed.delete(entry);
     }
   }
 
@@ -114,7 +117,6 @@ export class TurnStore {
     const entry = this.entry(turnRef);
     if (!isTerminalState(entry.state.state)) {
       entry.state = { ...next };
-      if (isTerminalState(next.state)) this.completed.add(entry);
     }
     // Keep this result available to the caller even if all older entries are retained.
     this.prune(entry);
@@ -122,10 +124,10 @@ export class TurnStore {
   }
 
   private prune(current?: Entry): void {
-    for (const entry of this.completed) {
-      if (this.completed.size <= MAX_COMPLETED_TURNS) break;
-      if (entry === current || entry.waiters !== 0) continue;
-      this.completed.delete(entry);
+    for (const entry of this.entries) {
+      if (this.entries.size <= MAX_CACHED_TURNS) break;
+      if (entry === current || entry.retainCount !== 0) continue;
+      this.entries.delete(entry);
       for (const ref of entry.refs) this.handles.delete(ref);
       const { sessionId, sourceRef } = entry.identity;
       if (sourceRef === 'dsh-turn:' + this.latestDshTurns.get(sessionId)) this.latestDshTurns.delete(sessionId);

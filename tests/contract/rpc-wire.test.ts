@@ -118,6 +118,29 @@ describe('current DSH RPC wire contract', () => {
     expect(retried.structuredContent).toMatchObject({ turnRef: target.turnRef, requestId: args.requestId, accepted: true });
     expect(runtime.turns.get(target.turnRef)?.state).toBe('accepted');
   });
+
+  it.each(['accepted', 'rejected'])('retains an in-flight submission under cache pressure until it is %s', async (outcome) => {
+    let started: () => void;
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    let finish: () => void;
+    const runtime = testRuntime({
+      events: { sessionSnapshot: async () => followSnapshot() },
+      rpc: { session: { prompt: () => new Promise((resolve) => {
+        finish = () => resolve(outcome === 'accepted'
+          ? { ok: true, value: { accepted: true } }
+          : { ok: false, error: new DshDomainError('model-unavailable', 'Select a model first') });
+        started();
+      }) } },
+    });
+    const sending = callTool(runtime, { sessionId: 'in-flight', requestId: 'request', message: 'Hello' });
+    await entered;
+    for (let index = 0; index < 300; index++) runtime.turns.register({ sessionId: 'other', sourceRef: 'rpc:' + index });
+    finish!();
+    const result = await sending;
+    expect(result.structuredContent).toMatchObject(outcome === 'accepted'
+      ? { accepted: true, requestId: 'request' }
+      : { error: { code: 'model-unavailable', target: { sessionId: 'in-flight', requestId: 'request' } } });
+  });
 });
 
 function callTool(runtime: Parameters<typeof callMcpTool>[0], args: Record<string, unknown>, name = 'dsh.session.send_message') {

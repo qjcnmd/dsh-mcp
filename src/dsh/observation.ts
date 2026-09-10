@@ -7,8 +7,7 @@ import { isRecord } from '../value-guards.js';
 
 interface Dependencies { events: DshEventClient; rpc: DshRpcClient; turns: TurnStore; }
 interface Subscription {
-  listeners: Set<() => void>;
-  sources: Set<string>;
+  watchers: Map<() => void, string | undefined>;
   stop: () => void;
   controller: AbortController;
   work: Promise<void>;
@@ -31,7 +30,7 @@ export class SessionObserver {
       subscription = undefined;
     }
     if (subscription === undefined) {
-      subscription = { listeners: new Set(), sources: new Set(), stop: () => undefined, controller: new AbortController(), work: Promise.resolve() };
+      subscription = { watchers: new Map(), stop: () => undefined, controller: new AbortController(), work: Promise.resolve() };
       this.subscriptions.set(sessionId, subscription);
       const current = subscription;
       subscription.stop = this.runtime.events.subscribeSession(sessionId, (event) => {
@@ -56,11 +55,11 @@ export class SessionObserver {
         });
       }, subscription.controller.signal);
     }
-    subscription.listeners.add(listener);
-    if (sourceRef !== undefined && !subscription.sources.has(sourceRef)) {
-      subscription.sources.add(sourceRef);
+    const addedSource = sourceRef !== undefined && !activeSources(subscription).includes(sourceRef);
+    subscription.watchers.set(listener, sourceRef);
+    if (addedSource) {
       const history = this.histories.get(sessionId);
-      if (history !== undefined && !history.covers(subscription.sources)) {
+      if (history !== undefined && !history.covers(activeSources(subscription))) {
         const current = subscription;
         this.enqueue(sessionId, current, () => this.refresh(sessionId, current));
       }
@@ -69,7 +68,7 @@ export class SessionObserver {
     return () => {
       if (released) return;
       released = true;
-      subscription.listeners.delete(listener);
+      subscription.watchers.delete(listener);
       this.releaseUnused(sessionId, subscription);
     };
   }
@@ -81,7 +80,7 @@ export class SessionObserver {
       subscription.error = new DshMcpError('transport-lost', 'The MCP connection closed.', { sessionId });
       subscription.stop();
       subscription.controller.abort();
-      for (const listener of [...subscription.listeners]) listener();
+      for (const listener of [...subscription.watchers.keys()]) listener();
     }
     this.subscriptions.clear();
     this.histories.clear();
@@ -89,7 +88,7 @@ export class SessionObserver {
 
   async inspect(sessionId: string, signal: AbortSignal): Promise<void> {
     const snapshot = await this.runtime.events.sessionSnapshot(sessionId, 20, signal);
-    const history = await loadSessionHistory(this.runtime.rpc, sessionId, { ...snapshot, throughSeq: snapshot.cursor }, new Set(), signal);
+    const history = await loadSessionHistory(this.runtime.rpc, sessionId, { ...snapshot, throughSeq: snapshot.cursor }, () => [], signal);
     signal.throwIfAborted();
     for (const turn of history.all()) this.runtime.turns.observe(sessionId, turn);
   }
@@ -110,7 +109,7 @@ export class SessionObserver {
 
   private async hydrate(sessionId: string, subscription: Subscription, snapshot: SessionFollowSnapshot): Promise<void> {
     const signal = subscription.controller.signal;
-    const history = await loadSessionHistory(this.runtime.rpc, sessionId, { ...snapshot, throughSeq: snapshot.cursor }, subscription.sources, signal);
+    const history = await loadSessionHistory(this.runtime.rpc, sessionId, { ...snapshot, throughSeq: snapshot.cursor }, () => activeSources(subscription), signal);
     signal.throwIfAborted();
     this.histories.set(sessionId, history);
     for (const turn of history.all()) this.runtime.turns.observe(sessionId, turn);
@@ -125,13 +124,13 @@ export class SessionObserver {
       subscription.stop();
       subscription.controller.abort();
     }).then(() => {
-      for (const listener of [...subscription.listeners]) listener();
+      for (const listener of [...subscription.watchers.keys()]) listener();
       this.releaseUnused(sessionId, subscription);
     });
   }
 
   private releaseUnused(sessionId: string, subscription: Subscription): void {
-    if (subscription.listeners.size !== 0) return;
+    if (subscription.watchers.size !== 0) return;
     subscription.stop();
     subscription.controller.abort();
     if (this.subscriptions.get(sessionId) === subscription) {
@@ -139,4 +138,8 @@ export class SessionObserver {
       this.histories.delete(sessionId);
     }
   }
+}
+
+function activeSources(subscription: Subscription): string[] {
+  return [...subscription.watchers.values()].filter((source) => source !== undefined);
 }

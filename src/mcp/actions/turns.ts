@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/server';
-import { isTerminalState, type TerminalReason, type TurnRecord } from '../../domain/turns.js';
+import { ACTIVE_TURN_STATES, TERMINAL_TURN_STATES, isTerminalState, type TerminalReason, type TurnRecord } from '../../domain/turns.js';
 import { DshMcpError, isAbortError } from '../../errors.js';
 import type { ProjectedToolResult } from '../result-projection.js';
 import type { ActionRuntime } from './common.js';
@@ -8,8 +8,8 @@ import { idSchema as id, projectToolResult, reasonSchema, registerAction, reques
 
 const waitOutputSchema = z.discriminatedUnion('state', [
   z.object({ state: z.literal('completed'), turnRef: id, sessionId: id, hasFinalResponse: z.boolean() }),
-  z.object({ state: z.enum(['failed', 'cancelled', 'interrupted', 'unknown']), turnRef: id, sessionId: id, reason: reasonSchema, hasFinalResponse: z.boolean() }),
-  z.object({ state: z.literal('timed_out'), turnRef: id, sessionId: id, observedState: z.enum(['accepted', 'running']) }),
+  z.object({ state: z.enum(TERMINAL_TURN_STATES).exclude(['completed']), turnRef: id, sessionId: id, reason: reasonSchema, hasFinalResponse: z.boolean() }),
+  z.object({ state: z.literal('timed_out'), turnRef: id, sessionId: id, observedState: z.enum(ACTIVE_TURN_STATES) }),
   z.object({ state: z.literal('transport_lost'), turnRef: id, sessionId: id, reason: reasonSchema }),
 ]);
 
@@ -29,20 +29,25 @@ export function registerTurnActions(server: McpServer, runtime: ActionRuntime): 
     await runtime.events.sessionSnapshot(args.sessionId, 1, requestSignal(ctx));
     const requestId = args.requestId ?? crypto.randomUUID();
     const record = runtime.turns.register({ sessionId: args.sessionId, sourceRef: 'rpc:' + requestId });
+    const release = runtime.turns.retain(record.turnRef);
     try {
-      const response = await runtime.rpc.session.prompt({
-        requestId, sessionId: args.sessionId, content: [{ type: 'text', text: args.message }],
-      }, requestSignal(ctx));
-      if (!response.ok) {
-        runtime.turns.reject(record.turnRef, response.error.message);
-        return toolError(response.error, { sessionId: args.sessionId, turnRef: record.turnRef, requestId });
+      try {
+        const response = await runtime.rpc.session.prompt({
+          requestId, sessionId: args.sessionId, content: [{ type: 'text', text: args.message }],
+        }, requestSignal(ctx));
+        if (!response.ok) {
+          runtime.turns.reject(record.turnRef, response.error.message);
+          return toolError(response.error, { sessionId: args.sessionId, turnRef: record.turnRef, requestId });
+        }
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        return toolExecutionError('submission-unknown', 'DSH may have accepted this message. Wait on turnRef, or retry the same message with requestId. ' + (error instanceof Error ? error.message : String(error)), { sessionId: args.sessionId, turnRef: record.turnRef, requestId });
       }
-    } catch (error) {
-      if (isAbortError(error)) throw error;
-      return toolExecutionError('submission-unknown', 'DSH may have accepted this message. Wait on turnRef, or retry the same message with requestId. ' + (error instanceof Error ? error.message : String(error)), { sessionId: args.sessionId, turnRef: record.turnRef, requestId });
+      runtime.turns.accept(record.turnRef);
+      return projectToolResult({ sessionId: args.sessionId, turnRef: record.turnRef, requestId, accepted: true }, 'Message accepted.');
+    } finally {
+      release();
     }
-    runtime.turns.accept(record.turnRef);
-    return projectToolResult({ sessionId: args.sessionId, turnRef: record.turnRef, requestId, accepted: true }, 'Message accepted.');
   });
 
   registerAction(server, 'dsh.session.wait_turn', {

@@ -10,7 +10,7 @@ import { loadConfig } from '../../dist/config.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const shellTool = process.platform === 'win32' ? 'pwsh' : 'bash';
-const availableCases = ['recovery', 'steering', 'cancellation'];
+const availableCases = ['recovery', 'observation', 'steering', 'cancellation'];
 const selectedCases = new Set(process.argv.length > 2 ? process.argv.slice(2) : availableCases);
 for (const name of selectedCases) if (!availableCases.includes(name)) throw new Error('Unknown live test case: ' + name);
 const clients = new Set();
@@ -84,6 +84,29 @@ try {
     report('durable-recovery', { repeatedRequestOnce: true, sessionTakeover: true, continuation: true, thinkingEffort: nextSelection.reasoningEffort, hostSelectedWorkspaceWrite: true });
   }
 
+  if (selectedCases.has('observation')) {
+    const sessionId = await createSession(model);
+    const older = await tool('dsh.session.send_message', { sessionId, message: 'Reply exactly OLDER COMPLETE.' });
+    requireState((await waitTurn(older.value.turnRef)).value, ['completed'], 'older turn');
+    const active = await tool('dsh.session.send_message', { sessionId, message: 'Call ' + shellTool + ' once with ' + sleepCommand(5) + '; exit, then reply exactly ACTIVE COMPLETE.' });
+    // Restore both identities together so the completed turn shares the live observation.
+    await restart();
+    const oldWait = waitTurn(older.value.turnRef);
+    const activeWait = waitTurn(active.value.turnRef);
+    const shortWait = tool('dsh.session.wait_turn', { turnRef: active.value.turnRef, timeoutMs: 500 });
+    const [oldResult, progress] = await Promise.all([oldWait, shortWait]);
+    requireState(oldResult.value, ['completed'], 'completed target in shared observation');
+    if (!oldResult.text.includes('OLDER COMPLETE')) throw new Error('The older wait returned another turn response');
+    requireState(progress.value, ['timed_out'], 'short waiter alongside an active waiter');
+    const steering = await tool('dsh.session.send_message', { sessionId, message: 'After the current command finishes, reply exactly SHARED WAIT VERIFIED. Do not run another command.' });
+    const [activeResult, steeringResult] = await Promise.all([activeWait, waitTurn(steering.value.turnRef)]);
+    for (const result of [activeResult, steeringResult]) {
+      requireState(result.value, ['completed'], 'remaining shared wait');
+      if (!result.text.includes('SHARED WAIT VERIFIED')) throw new Error('A shared wait lost the final steering response');
+    }
+    report('shared-observation', { restoredCompletedTarget: true, overlappingWaits: true, timeoutReleased: true, remainingWaitsCompleted: true });
+  }
+
   if (selectedCases.has('steering')) {
     const sessionId = await createSession(model);
     const first = await tool('dsh.session.send_message', { sessionId, message: 'Call ' + shellTool + ' once with ' + sleepCommand(5) + '; exit, then reply exactly FIRST DONE.' });
@@ -109,7 +132,7 @@ try {
     await delay(500);
     await tool('dsh.session.cancel', { sessionId: cancelSessionId });
     requireState((await cancelWait).value, ['cancelled'], 'cancelled turn');
-    const resumed = await tool('dsh.session.send_message', { sessionId: cancelSessionId, message: 'The previous task is cancelled. Reply exactly RESUMED, without using tools.' });
+    const resumed = await tool('dsh.session.send_message', { sessionId: cancelSessionId, message: 'Call ' + shellTool + ' once with exit to close this test session terminal, then reply exactly RESUMED.' });
     const result = await waitTurn(resumed.value.turnRef);
     requireState(result.value, ['completed'], 'continued session after cancellation');
     if (!result.text.includes('RESUMED')) throw new Error('Cancelled session did not accept a new task');

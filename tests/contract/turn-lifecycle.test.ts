@@ -1,13 +1,14 @@
 import { testRuntime, followSnapshot } from '../unit/fixtures.js';
 import { callMcpTool } from '../unit/fixtures.js';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { DshEvent as Event } from '../../src/dsh/event-client.js';
 import { TurnStore } from '../../src/domain/turns.js';
 import { SessionHistory } from '../../src/dsh/session-history.js';
 import { waitForTurn } from '../../src/mcp/actions/turns.js';
+import { DshTransportError } from '../../src/errors.js';
 
 describe('turn lifecycle projection', () => {
-  it('evicts old completed turns and their aliases while preserving active and retried submissions', () => {
+  it('evicts old completed turns and their aliases while preserving retained turns', () => {
     const store = new TurnStore();
     const receipt = store.register({ sessionId: 'old', sourceRef: 'rpc:old' });
     const completed = store.observe('old', { turn: 1, requestIds: ['old'], state: 'completed', reason: null, finalResponse: 'old answer' });
@@ -15,6 +16,8 @@ describe('turn lifecycle projection', () => {
     store.reject(pending.turnRef, 'temporarily unavailable');
     store.accept(pending.turnRef);
     const running = store.observe('running', { turn: 1, requestIds: [], state: 'running', reason: null, finalResponse: null });
+    const releasePending = store.retain(pending.turnRef);
+    const releaseRunning = store.retain(running.turnRef);
 
     for (let turn = 1; turn <= 1_000; turn++) {
       store.observe('recent', { turn, requestIds: [], state: 'completed', reason: null, finalResponse: 'answer ' + turn });
@@ -27,6 +30,82 @@ describe('turn lifecycle projection', () => {
     expect(store.get(pending.turnRef)?.state).toBe('accepted');
     expect(store.get(running.turnRef)?.state).toBe('running');
     expect(store.restore(receipt.turnRef)).toMatchObject({ sessionId: 'old', sourceRef: 'rpc:old', state: 'accepted' });
+    releasePending();
+    releaseRunning();
+  });
+
+  it('evicts unobserved receipts and restores their results from DSH when later awaited', async () => {
+    const runtime = testRuntime({ events: { subscribeSession: (sessionId, listener) => {
+      queueMicrotask(() => listener({ method: 'session/snapshot', payload: { sessionId, snapshot: follow([
+        record(0, 'turn/start', { turn: 1 }),
+        record(1, 'user/message', { source: { kind: 'user', rpcId: 'unobserved-0' } }, 'append'),
+        record(2, 'assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'recovered answer' }] } }, 'append'),
+        record(3, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+      ]) } }));
+      return () => undefined;
+    } } });
+    const receipts = Array.from({ length: 300 }, (_, index) => runtime.turns.register({ sessionId: 'unobserved', sourceRef: 'rpc:unobserved-' + index }));
+    const first = receipts[0]!;
+    expect(runtime.turns.get(first.turnRef)).toBeUndefined();
+    expect(runtime.turns.get(receipts.at(-1)!.turnRef)?.state).toBe('accepted');
+    const result = await waitForTurn(runtime, first.turnRef, 1_000, new AbortController().signal);
+    expect(result.structuredContent).toMatchObject({ state: 'completed', turnRef: first.turnRef });
+    expect(result.content[1]).toEqual({ type: 'text', text: 'recovered answer' });
+  });
+
+  it.each(['live', 'history'])('returns an early failure from claimed inbox input through %s observation', async (delivery) => {
+    const receipt = new TurnStore().register({ sessionId: 'early', sourceRef: 'rpc:early-request' });
+    const records = [
+      record(0, 'agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [{ source: { kind: 'user', rpcId: 'early-request' } }] }),
+      record(1, 'turn/start', { turn: 1 }),
+      record(2, 'agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 1, inserted: [] }),
+      record(3, 'turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'CONFIG', message: 'Model preparation failed' } } }),
+    ];
+    let listener: (event: Event) => void;
+    const pages: number[] = [];
+    const runtime = testRuntime({
+      events: { subscribeSession: (_id, next) => { listener = next; return () => undefined; } },
+      rpc: { session: { page: async (request) => {
+        pages.push(request.beforeSeq!);
+        return { ok: true, value: { records: records.slice(0, 1), hasMore: false } };
+      } } },
+    });
+    const waiting = waitForTurn(runtime, receipt.turnRef, 100, new AbortController().signal);
+    if (delivery === 'live') {
+      listener!({ method: 'session/snapshot', payload: { sessionId: 'early', snapshot: follow([]) } });
+      for (const item of records) listener!({ method: 'session/follow', payload: { sessionId: 'early', event: item.event } });
+    } else {
+      listener!({ method: 'session/snapshot', payload: { sessionId: 'early', snapshot: follow(records.slice(1), true) } });
+    }
+    expect((await waiting).structuredContent).toMatchObject({ state: 'failed', turnRef: receipt.turnRef, reason: { code: 'CONFIG', message: 'Model preparation failed' } });
+    expect(pages).toEqual(delivery === 'history' ? [1] : []);
+  });
+
+  it('tracks inbox indices across partial history, replacement, cancellation and steering', () => {
+    const input = (rpcId: string) => ({ source: { kind: 'user', rpcId } });
+    const splice = (target: string, start: number, removedCount: number, inserted: ReturnType<typeof input>[], outcome?: 'canceled') =>
+      historyEvent('agent/inbox/spliced', { target, start, removedCount, inserted, ...(outcome === undefined ? {} : { outcome }) });
+    const history = new SessionHistory([
+      // The page starts after two unrelated inputs were queued; their identities are unknown.
+      splice('next-step', 2, 0, [input('replaced')]),
+      splice('next-step', 2, 1, [input('first')], 'canceled'),
+      splice('next-step', 3, 0, [input('discarded')]),
+      splice('next-step', 3, 1, [], 'canceled'),
+      splice('next-turn', 0, 0, [input('queued')]),
+      historyEvent('turn/start', { turn: 1 }),
+      splice('next-step', 0, 3, []),
+      splice('next-step', 0, 0, [input('steering')]),
+      splice('next-step', 0, 1, []),
+      historyEvent('user/message', { source: { kind: 'user', rpcId: 'first' } }, 'append'),
+      historyEvent('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } }),
+      historyEvent('turn/start', { turn: 2 }),
+      splice('next-turn', 0, 1, []),
+      historyEvent('turn/end', { turn: 2, reason: { kind: 'blocked' } }),
+    ]);
+    expect(history.all()).toMatchObject([
+      { turn: 1, state: 'cancelled', requestIds: ['first', 'steering'] },
+      { turn: 2, state: 'failed', requestIds: ['queued'] },
+    ]);
   });
 
   it('retains steering aliases through large history hydration and recovers them after eviction', async () => {
@@ -222,6 +301,117 @@ describe('turn lifecycle projection', () => {
     for (const result of await Promise.all(waits)) expect(result.structuredContent).toMatchObject({ state: 'completed' });
     expect(subscriptions).toBe(1);
     expect(runtime.turns.get(older.turnRef)?.state).toBe('accepted');
+  });
+
+  it('refreshes active waits using their targets after an older wait completes', async () => {
+    let listener: (event: Event) => void;
+    const older = [
+      record(0, 'turn/start', { turn: 1 }),
+      record(1, 'user/message', { source: { kind: 'user', rpcId: 'older' } }),
+      record(2, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+    ];
+    const active = [
+      record(3, 'turn/start', { turn: 2 }),
+      record(4, 'user/message', { source: { kind: 'user', rpcId: 'active' } }),
+    ];
+    const page = vi.fn(async () => { throw new DshTransportError('Older history unavailable'); });
+    const runtime = testRuntime({
+      events: {
+        subscribeSession: (_id, next) => { listener = next; return () => undefined; },
+        sessionSnapshot: async () => follow([
+          ...active,
+          record(5, 'user/message', { source: { kind: 'user', rpcId: 'steering' } }),
+          record(6, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+        ], true),
+      },
+      rpc: { session: { page } },
+    });
+    const wait = (source: string) => {
+      const receipt = runtime.turns.register({ sessionId: 'shared', sourceRef: 'rpc:' + source });
+      return waitForTurn(runtime, receipt.turnRef, 1_000, new AbortController().signal);
+    };
+    try {
+      const oldWait = wait('older');
+      const activeWait = wait('active');
+      listener!({ method: 'session/snapshot', payload: { sessionId: 'shared', snapshot: follow([...older, ...active]) } });
+      expect((await oldWait).structuredContent).toMatchObject({ state: 'completed' });
+      const steeringWait = wait('steering');
+      for (const result of await Promise.all([activeWait, steeringWait])) {
+        expect(result.structuredContent).toMatchObject({ state: 'completed' });
+      }
+      expect(page).not.toHaveBeenCalled();
+    } finally {
+      runtime.observations.close();
+    }
+  });
+
+  it.each(['abort', 'timeout'])('updates backfill targets when a wait ends by %s during a page read', async (outcome) => {
+    let listener: (event: Event) => void;
+    let releasePage: () => void;
+    const pageReady = new Promise<void>((resolve) => { releasePage = resolve; });
+    const page = vi.fn(async () => {
+      await pageReady;
+      return { ok: true as const, value: { records: [
+        record(50, 'turn/start', { turn: 2 }),
+        record(51, 'user/message', { source: { kind: 'user', rpcId: 'active' } }),
+      ], hasMore: true } };
+    });
+    const runtime = testRuntime({
+      events: { subscribeSession: (_id, next) => { listener = next; return () => undefined; } },
+      rpc: { session: { page } },
+    });
+    const older = runtime.turns.register({ sessionId: 'shared', sourceRef: 'rpc:older' });
+    const active = runtime.turns.register({ sessionId: 'shared', sourceRef: 'rpc:active' });
+    const controller = new AbortController();
+    try {
+      const oldWait = waitForTurn(runtime, older.turnRef, outcome === 'timeout' ? 10 : 1_000, controller.signal);
+      const activeWait = waitForTurn(runtime, active.turnRef, 1_000, new AbortController().signal);
+      listener!({ method: 'session/snapshot', payload: { sessionId: 'shared', snapshot: follow([
+        record(99, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+      ], true) } });
+      await vi.waitFor(() => expect(page).toHaveBeenCalledTimes(1));
+      if (outcome === 'abort') {
+        controller.abort();
+        await expect(oldWait).rejects.toMatchObject({ name: 'AbortError' });
+      } else {
+        expect((await oldWait).structuredContent).toMatchObject({ state: 'timed_out' });
+      }
+      releasePage!();
+      expect((await activeWait).structuredContent).toMatchObject({ state: 'completed' });
+      expect(page).toHaveBeenCalledTimes(1);
+    } finally {
+      releasePage!();
+      runtime.observations.close();
+    }
+  });
+
+  it('retains a shared backfill target until its last waiter releases it', async () => {
+    let listener: (event: Event) => void;
+    const page = vi.fn(async () => ({ ok: true as const, value: { records: [
+      record(0, 'turn/start', { turn: 1 }),
+      record(1, 'user/message', { source: { kind: 'user', rpcId: 'older' } }),
+      record(2, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+    ], hasMore: false } }));
+    const runtime = testRuntime({
+      events: { subscribeSession: (_id, next) => { listener = next; return () => undefined; } },
+      rpc: { session: { page } },
+    });
+    const receipt = runtime.turns.register({ sessionId: 'shared', sourceRef: 'rpc:older' });
+    const controller = new AbortController();
+    try {
+      const stopped = waitForTurn(runtime, receipt.turnRef, 1_000, controller.signal);
+      const remaining = waitForTurn(runtime, receipt.turnRef, 1_000, new AbortController().signal);
+      controller.abort();
+      await expect(stopped).rejects.toMatchObject({ name: 'AbortError' });
+      listener!({ method: 'session/snapshot', payload: { sessionId: 'shared', snapshot: follow([
+        record(10, 'turn/start', { turn: 2 }),
+        record(11, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+      ], true) } });
+      expect((await remaining).structuredContent).toMatchObject({ state: 'completed', turnRef: receipt.turnRef });
+      expect(page).toHaveBeenCalledTimes(1);
+    } finally {
+      runtime.observations.close();
+    }
   });
 
   it.each(['completed', 'error'])('keeps intermediate output out of waits for %s', async (kind) => {
