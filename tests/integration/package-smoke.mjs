@@ -22,10 +22,12 @@ try {
   assert(paths.includes('LICENSE'));
   assert(paths.includes('README.md'));
   assert(paths.includes('dist/server.js'));
-  assert(paths.every((path) => ['package.json', 'LICENSE', 'README.md'].includes(path) || /^dist\/.*\.js$/.test(path)), 'The install package contains non-runtime files');
+  const pluginFiles = ['plugins/dsh-mcp/skills/dsh-mcp/SKILL.md', 'plugins/dsh-mcp/.codex-plugin/plugin.json', 'plugins/dsh-mcp/.mcp.json'];
+  for (const path of pluginFiles) assert(paths.includes(path));
+  assert(paths.every((path) => ['package.json', 'LICENSE', 'README.md', ...pluginFiles].includes(path) || /^dist\/.*\.js$/.test(path)), 'The install package contains unexpected files');
   await npm(['install', '--global', '--prefix', installation, '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', join(temporary, packed.filename)]);
   const moduleRoot = (await npm(['root', '--global', '--prefix', installation])).stdout.trim();
-  const manifest = JSON.parse(await readFile(join(moduleRoot, '@qjcnmd', 'dsh-mcp', 'package.json'), 'utf8'));
+  const manifest = JSON.parse(await readFile(join(moduleRoot, packed.name, 'package.json'), 'utf8'));
   assert.equal(manifest.bin['dsh-mcp'], 'dist/server.js');
   assert.equal(manifest.license, 'MIT');
   const command = process.platform === 'win32' ? 'cmd.exe' : join(installation, 'bin', 'dsh-mcp');

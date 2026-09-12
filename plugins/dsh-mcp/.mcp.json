@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "dsh": {
+      "command": "npx",
+      "args": ["--yes", "--package", "git+https://github.com/qjcnmd/dsh-mcp.git#v0.2.0", "dsh-mcp"],
+      "startup_timeout_sec": 180,
+      "tool_timeout_sec": 660
+    }
+  }
+}

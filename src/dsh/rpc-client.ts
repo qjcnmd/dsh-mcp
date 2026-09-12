@@ -19,6 +19,8 @@ export interface DshSessionSummary {
 }
 export interface SessionListValue { items: DshSessionSummary[]; }
 export interface SessionCreateValue { sessionId: string; agentPreset?: string; }
+export interface WorkspaceView { workspaceId: string; path: string; title: string; sessionIds: string[]; }
+export interface WorkspaceBaseline { items: WorkspaceView[]; archivedSessionIds: string[]; }
 export interface SessionHistoryRecord { type: 'event'; event: Record<string, unknown>; }
 export interface SessionPageValue { records: SessionHistoryRecord[]; hasMore: boolean; }
 export interface ModelSelection { provider: string; model: string; reasoningEffort?: string; }
@@ -95,7 +97,7 @@ export class DshRpcClient {
 
   session = {
     list: (signal?: AbortSignal) => this.call<SessionListValue>('session/list', { _request: {} }, signal),
-    create: (request: { cwd: string; sessionId?: string; agentPreset: 'minimal' }, signal?: AbortSignal) => this.call<SessionCreateValue>('session/create', { request }, signal),
+    create: (request: { workspaceId: string; sessionId?: string; agentPreset: 'minimal' }, signal?: AbortSignal) => this.call<SessionCreateValue>('session/create', { request }, signal),
     page: (request: { sessionId: string; throughSeq: number; beforeSeq?: number; maxMessages?: number }, signal?: AbortSignal) => this.call<SessionPageValue>('session/page', {
       request: {
         address: { kind: 'session', sessionId: request.sessionId },
@@ -108,6 +110,10 @@ export class DshRpcClient {
     selectModel: (request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }, signal?: AbortSignal) => this.call<{ selected: ModelSelection }>('session/selectModel', { request }, signal),
     prompt: (request: SessionPromptPayload, signal?: AbortSignal) => this.call<{ accepted: true }>('session/prompt', { request: { ...request, mode: 'steer' } }, signal),
     cancel: (request: { sessionId: string }, signal?: AbortSignal) => this.call<{ accepted: true }>('session/cancel', { request }, signal),
+  };
+
+  workspace = {
+    create: (path: string, signal?: AbortSignal) => this.call<{ workspace: WorkspaceView; created: boolean }>('workspace/create', { request: { path } }, signal),
   };
 
   async setFullAccess(sessionId: string, signal?: AbortSignal): Promise<void> {

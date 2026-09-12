@@ -8,17 +8,18 @@ import type { SessionHistoryRecord } from '../../src/dsh/rpc-client.js';
 import { SessionObserver } from '../../src/dsh/observation.js';
 import { TurnStore } from '../../src/domain/turns.js';
 
-type RpcOverrides = { session?: Partial<DshRpcClient['session']>; setFullAccess?: DshRpcClient['setFullAccess'] };
-type EventOverrides = Partial<Pick<DshEventClient, 'subscribeSession' | 'sessionSnapshot' | 'archivedSessionIds'>>;
+type RpcOverrides = { session?: Partial<DshRpcClient['session']>; workspace?: Partial<DshRpcClient['workspace']>; setFullAccess?: DshRpcClient['setFullAccess'] };
+type EventOverrides = Partial<Pick<DshEventClient, 'subscribeSession' | 'sessionSnapshot' | 'archivedSessionIds' | 'workspaceSnapshot'>>;
 
 export function testRuntime(overrides: { rpc?: RpcOverrides; events?: EventOverrides; turns?: TurnStore } = {}): DshRuntime {
   const config = loadConfig({});
   const unexpected = (): never => { throw new Error('Unexpected DSH call: configure the test dependency explicitly.'); };
   const rpc = new DshRpcClient(config, unexpected);
   Object.assign(rpc.session, overrides.rpc?.session);
+  Object.assign(rpc.workspace, overrides.rpc?.workspace);
   if (overrides.rpc?.setFullAccess) rpc.setFullAccess = overrides.rpc.setFullAccess;
   const events = Object.assign(new DshEventClient(config, unexpected), {
-    subscribeSession: unexpected, sessionSnapshot: unexpected, archivedSessionIds: unexpected,
+    subscribeSession: unexpected, sessionSnapshot: unexpected, archivedSessionIds: unexpected, workspaceSnapshot: unexpected,
   }, overrides.events);
   const dependencies = { rpc, events, turns: overrides.turns ?? new TurnStore() };
   return Object.assign(dependencies, { observations: new SessionObserver(dependencies) });

@@ -15,6 +15,7 @@ const selectedCases = new Set(process.argv.length > 2 ? process.argv.slice(2) : 
 for (const name of selectedCases) if (!availableCases.includes(name)) throw new Error('Unknown live test case: ' + name);
 const clients = new Set();
 const createdSessions = [];
+const createdWorkspaces = new Set();
 const cleanupFailures = [];
 const tempRoot = resolve(tmpdir());
 const probeDirectory = await mkdtemp(resolve(tempRoot, 'dsh-mcp-live-'));
@@ -67,7 +68,7 @@ try {
     const recovered = await waitTurn(sent.value.turnRef);
     requireState(recovered.value, ['completed'], 'cross-process wait');
     if (!recovered.text.includes('DSH MCP smoke test passed.')) throw new Error('Recovered response was incomplete');
-    const adopted = await tool('dsh.session.wait_turn', { sessionId, timeoutMs: 30_000 });
+    const adopted = await tool('dsh.session.wait_turn', { sessionId });
     requireState(adopted.value, ['completed'], 'existing-session takeover');
     // Change only the thinking effort before a second turn in the same session.
     const otherEffort = advertised.reasoningEfforts.find((value) => value !== effort);
@@ -93,27 +94,25 @@ try {
     await restart();
     const oldWait = waitTurn(older.value.turnRef);
     const activeWait = waitTurn(active.value.turnRef);
-    const shortWait = tool('dsh.session.wait_turn', { turnRef: active.value.turnRef, timeoutMs: 500 });
-    const [oldResult, progress] = await Promise.all([oldWait, shortWait]);
+    const oldResult = await oldWait;
     requireState(oldResult.value, ['completed'], 'completed target in shared observation');
     if (!oldResult.text.includes('OLDER COMPLETE')) throw new Error('The older wait returned another turn response');
-    requireState(progress.value, ['timed_out'], 'short waiter alongside an active waiter');
     const steering = await tool('dsh.session.send_message', { sessionId, message: 'After the current command finishes, reply exactly SHARED WAIT VERIFIED. Do not run another command.' });
     const [activeResult, steeringResult] = await Promise.all([activeWait, waitTurn(steering.value.turnRef)]);
     for (const result of [activeResult, steeringResult]) {
       requireState(result.value, ['completed'], 'remaining shared wait');
       if (!result.text.includes('SHARED WAIT VERIFIED')) throw new Error('A shared wait lost the final steering response');
     }
-    report('shared-observation', { restoredCompletedTarget: true, overlappingWaits: true, timeoutReleased: true, remainingWaitsCompleted: true });
+    report('shared-observation', { restoredCompletedTarget: true, overlappingWaits: true, remainingWaitsCompleted: true });
   }
 
   if (selectedCases.has('steering')) {
     const sessionId = await createSession(model);
     const first = await tool('dsh.session.send_message', { sessionId, message: 'Call ' + shellTool + ' once with ' + sleepCommand(5) + '; exit, then reply exactly FIRST DONE.' });
-    const progress = await tool('dsh.session.wait_turn', { turnRef: first.value.turnRef, timeoutMs: 500 });
-    requireState(progress.value, ['timed_out'], 'active work before steering');
+    const firstWait = waitTurn(first.value.turnRef);
+    await delay(500);
     const second = await tool('dsh.session.send_message', { sessionId, message: 'Update to the current task: after the command finishes, reply exactly STEER VERIFIED instead of FIRST DONE. Do not run another command.' });
-    const firstResult = await waitTurn(first.value.turnRef);
+    const firstResult = await firstWait;
     const secondResult = await waitTurn(second.value.turnRef);
     requireState(firstResult.value, ['completed'], 'steered task');
     requireState(secondResult.value, ['completed'], 'steering receipt');
@@ -147,6 +146,9 @@ try {
     try { await tool('dsh.session.cancel', { sessionId }); } catch (error) { cleanupFailures.push(error); }
     try { await raw('workspace/archiveSession', { request: { sessionId } }); } catch (error) { cleanupFailures.push(error); }
   }
+  for (const workspaceId of createdWorkspaces) {
+    try { await raw('workspace/delete', { request: { workspaceId } }); } catch (error) { cleanupFailures.push(error); }
+  }
   for (const directory of [probeDirectory]) {
     const childPath = relative(tempRoot, resolve(directory));
     if (childPath === '' || childPath.startsWith('..') || isAbsolute(childPath)) { cleanupFailures.push(new Error('Refusing cleanup outside the test temporary root')); continue; }
@@ -171,9 +173,12 @@ async function createSession(model) {
   const result = await tool('dsh.session.create', { cwd: probeDirectory });
   const sessionId = result.value.sessionId;
   createdSessions.push(sessionId);
+  createdWorkspaces.add(result.value.workspaceId);
   if (result.value.cwd !== probeDirectory) throw new Error('DSH session uses another project');
   const listed = await tool('dsh.session.list', { cwd: probeDirectory });
-  if (!listed.value.items.some((item) => item.sessionId === sessionId)) throw new Error('Created session is absent from its workspace');
+  if (!listed.value.items.some((item) => item.sessionId === sessionId)) throw new Error('Created session is absent from the directory listing');
+  const baseline = await events.workspaceSnapshot();
+  if (!baseline.items.some((item) => item.workspaceId === result.value.workspaceId && item.sessionIds.includes(sessionId))) throw new Error('Created session is absent from its native workspace');
   if (model) await selectModel(sessionId, model);
   return sessionId;
 }
@@ -198,12 +203,9 @@ async function tool(name, args) {
   return { value: result.structuredContent, text };
 }
 async function waitTurn(turnRef) {
-  const deadline = Date.now() + 180_000;
-  do {
-    const result = await tool('dsh.session.wait_turn', { turnRef, timeoutMs: 30_000 });
-    if (result.value.state !== 'timed_out') return result;
-  } while (Date.now() < deadline);
-  throw new Error('DSH turn exceeded the live-test deadline: ' + turnRef);
+  const result = await tool('dsh.session.wait_turn', { turnRef });
+  if (result.value.state === 'timed_out') throw new Error('DSH turn exceeded the ten-minute live-test deadline: ' + turnRef);
+  return result;
 }
 function requireState(value, allowed, label) {
   if (!allowed.includes(value.state)) throw new Error(label + ' ended in ' + value.state + ': ' + JSON.stringify(value.reason));

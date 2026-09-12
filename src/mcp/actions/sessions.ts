@@ -23,23 +23,30 @@ export function registerSessionActions(server: McpServer, runtime: ActionRuntime
   });
 
   registerAction(server, 'dsh.session.create', {
-    description: 'Create a DSH session using the minimal preset and danger-full-access permissions.',
+    description: 'Create a minimal, full-access DSH session in the workspace for cwd. Reuses the native workspace for this directory, or registers it if absent.',
     inputSchema: z.object({ cwd: cwdSchema.describe('Absolute initial working directory for the new session.') }),
-    outputSchema: z.object({ sessionId, cwd: z.string() }),
+    outputSchema: z.object({ sessionId, cwd: z.string(), workspaceId: z.string() }),
   }, async (args, ctx) => {
     const signal = requestSignal(ctx);
     if (!(await stat(args.cwd)).isDirectory()) return toolExecutionError('invalid-directory', `Not a directory: ${args.cwd}`);
-    const result = await runtime.rpc.session.create({ cwd: args.cwd, agentPreset: 'minimal' }, signal);
+    const registered = await runtime.rpc.workspace.create(args.cwd, signal);
+    if (!registered.ok) throw registered.error;
+    const { workspace } = registered.value;
+    const result = await runtime.rpc.session.create({ workspaceId: workspace.workspaceId, agentPreset: 'minimal' }, signal);
     if (!result.ok) throw result.error;
     const sessionId = result.value.sessionId;
     try {
       await runtime.rpc.setFullAccess(sessionId, signal);
       await runtime.events.sessionSnapshot(sessionId, 1, signal);
+      const baseline = await runtime.events.workspaceSnapshot(signal);
+      if (!baseline.items.some((item) => item.workspaceId === workspace.workspaceId && item.sessionIds.includes(sessionId))) {
+        throw new Error('DSH did not associate the session with its workspace');
+      }
     } catch (error) {
       signal.throwIfAborted();
-      return toolExecutionError('session-setup-failed', `Created ${sessionId}, but could not confirm full-access setup: ${error instanceof Error ? error.message : String(error)}`, { sessionId });
+      return toolExecutionError('session-setup-failed', `Created ${sessionId}, but setup could not be confirmed: ${error instanceof Error ? error.message : String(error)}`, { sessionId, workspaceId: workspace.workspaceId });
     }
-    return projectToolResult({ sessionId, cwd: args.cwd }, `Created session ${sessionId}.`);
+    return projectToolResult({ sessionId, cwd: workspace.path, workspaceId: workspace.workspaceId }, `Created session ${sessionId} in ${workspace.title}.`);
   });
 
 }

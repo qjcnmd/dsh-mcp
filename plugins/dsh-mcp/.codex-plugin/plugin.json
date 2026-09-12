@@ -1,0 +1,19 @@
+{
+  "name": "dsh-mcp",
+  "version": "0.2.0",
+  "description": "通过 DSH MCP 使用本机 DSH，附带跨项目任务操作 skill。",
+  "author": { "name": "qjcnmd" },
+  "repository": "https://github.com/qjcnmd/dsh-mcp",
+  "license": "MIT",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "DSH MCP",
+    "shortDescription": "通过 MCP 使用 DSH 会话与任务",
+    "longDescription": "连接本机 DSH，创建或继续不同项目的会话、选择模型、发送任务、等待结果及取消执行。配套 skill 指导任务交接与结果处理。",
+    "developerName": "qjcnmd",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["使用 DSH 完成当前项目中的任务。"]
+  }
+}

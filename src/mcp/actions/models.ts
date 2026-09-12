@@ -9,7 +9,7 @@ const modelSchema = z.object({ provider: z.string(), model: z.string(), label: z
 
 export function registerModelActions(server: McpServer, runtime: ActionRuntime): void {
   registerAction(server, 'dsh.session.models', {
-    description: 'List available models, reasoning efforts and provider errors. Return the effective model selection for sessionId, or the service default when omitted.',
+    description: 'Discover available provider/model IDs and supported reasoning efforts before selecting them. With sessionId, return the effective session selection; without it, return the service default. Also reports provider discovery failures.',
     inputSchema: z.object({ sessionId: sessionId.optional() }),
     outputSchema: z.object({ sessionId: sessionId.nullable(), selection: selectionSchema, selectionSource: z.enum(['session', 'default']), models: z.array(modelSchema), failures: z.array(z.object({ id: z.string(), name: z.string(), message: z.string() })) }),
   }, async (args, ctx) => {
@@ -32,7 +32,7 @@ export function registerModelActions(server: McpServer, runtime: ActionRuntime):
   });
 
   registerAction(server, 'dsh.session.select_model', {
-    description: 'Select an available provider, model, and optional reasoning effort for one session.',
+    description: 'Configure the provider, model and optional reasoning effort for a session using IDs from models. The selected result confirms the effective setting; it need not be repeated in task text. Use this tool to change model settings.',
     inputSchema: z.object({
       sessionId,
       provider: z.string().trim().min(1),

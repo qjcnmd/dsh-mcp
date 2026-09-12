@@ -49,6 +49,7 @@ describe('minimal project tool surface', () => {
     expect(input('select_model').reasoningEffort).toBeDefined();
     expect(input('send_message').mode).toBeUndefined();
     expect(input('send_message').content).toBeUndefined();
+    expect(input('wait_turn').timeoutMs).toBeUndefined();
   });
 
   it('pages through the current project and explains unsupported presets', async () => {
@@ -91,20 +92,32 @@ describe('minimal project tool surface', () => {
     expect(await callMcpTool(runtime, 'dsh.session.list', { cwd: otherDirectory, cursor: value.nextCursor })).toMatchObject({ isError: true, structuredContent: { error: { code: 'invalid-cursor' } } });
   });
 
-  it('creates minimal in the requested directory, then sets and verifies full access', async () => {
+  it('creates minimal through the native workspace and verifies membership and full access', async () => {
     const calls: unknown[] = [];
+    const cwd = join(process.cwd(), '..');
+    const workspace = { workspaceId: 'workspace-1', path: cwd, title: 'Project', sessionIds: ['new'] };
     const runtime = testRuntime({
       rpc: {
+        workspace: { create: async (path) => { calls.push(['workspace', path]); return { ok: true, value: { workspace, created: false } }; } },
         session: { create: async (request) => { calls.push(request); return { ok: true, value: { sessionId: 'new' } }; } },
         setFullAccess: async (sessionId) => { calls.push(['permission', sessionId]); },
       },
-      events: { sessionSnapshot: async (sessionId) => { calls.push(['verify', sessionId]); return followSnapshot(); } },
+      events: {
+        sessionSnapshot: async (sessionId) => { calls.push(['verify', sessionId]); return followSnapshot(); },
+        workspaceSnapshot: async () => ({ items: [workspace], archivedSessionIds: [] }),
+      },
     });
-    const cwd = join(process.cwd(), '..');
-    expect((await callMcpTool(runtime, 'dsh.session.create', { cwd })).structuredContent).toEqual({ sessionId: 'new', cwd });
-    expect(calls).toEqual([{ cwd, agentPreset: 'minimal' }, ['permission', 'new'], ['verify', 'new']]);
+    expect((await callMcpTool(runtime, 'dsh.session.create', { cwd })).structuredContent).toEqual({ sessionId: 'new', cwd, workspaceId: workspace.workspaceId });
+    expect(calls).toEqual([['workspace', cwd], { workspaceId: workspace.workspaceId, agentPreset: 'minimal' }, ['permission', 'new'], ['verify', 'new']]);
+    workspace.sessionIds = [];
+    expect(await callMcpTool(runtime, 'dsh.session.create', { cwd })).toMatchObject({ isError: true, structuredContent: { error: { code: 'session-setup-failed', target: { sessionId: 'new', workspaceId: 'workspace-1' } } } });
     runtime.rpc.setFullAccess = async () => { throw new Error('permission unavailable'); };
     expect(await callMcpTool(runtime, 'dsh.session.create', { cwd })).toMatchObject({ isError: true, structuredContent: { error: { code: 'session-setup-failed', target: { sessionId: 'new' } } } });
+  });
+
+  it('does not create an ungrouped session when workspace registration fails', async () => {
+    const runtime = testRuntime({ rpc: { workspace: { create: async () => ({ ok: false, error: new DshDomainError('workspace/invalid-path', 'Unavailable directory') }) } } });
+    expect(await callMcpTool(runtime, 'dsh.session.create', { cwd: process.cwd() })).toMatchObject({ isError: true, structuredContent: { error: { code: 'workspace/invalid-path' } } });
   });
 
   it('requires an absolute workspace and rejects a file before creating a session', async () => {

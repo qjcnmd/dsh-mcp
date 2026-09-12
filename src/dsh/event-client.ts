@@ -3,7 +3,7 @@ import type { RawData } from 'ws';
 import type { DshConfig } from '../config.js';
 import { DshDomainError, DshProtocolError, DshTransportError } from '../errors.js';
 import { DshAuthSession, type FetchLike } from './auth.js';
-import type { SessionHistoryRecord } from './rpc-client.js';
+import type { SessionHistoryRecord, WorkspaceBaseline } from './rpc-client.js';
 import { assertSupportedSession } from './session-scope.js';
 import { isRecord } from '../value-guards.js';
 
@@ -73,11 +73,19 @@ export class DshEventClient {
   }
 
   async archivedSessionIds(signal?: AbortSignal): Promise<string[]> {
+    return (await this.workspaceSnapshot(signal)).archivedSessionIds;
+  }
+
+  async workspaceSnapshot(signal?: AbortSignal): Promise<WorkspaceBaseline> {
     const frame = await this.firstFrame('workspace/follow', { args: {} }, 'baseline', signal);
-    if (!isRecord(frame) || !isRecord(frame.value) || !Array.isArray(frame.value.archivedSessionIds) || !frame.value.archivedSessionIds.every((id) => typeof id === 'string')) {
-      throw new DshProtocolError('DSH returned invalid archived session IDs');
+    if (!isRecord(frame) || !isRecord(frame.value)
+      || !Array.isArray(frame.value.archivedSessionIds) || !frame.value.archivedSessionIds.every((id) => typeof id === 'string')
+      || !Array.isArray(frame.value.items) || !frame.value.items.every((item) => isRecord(item)
+        && typeof item.workspaceId === 'string' && typeof item.path === 'string' && typeof item.title === 'string'
+        && Array.isArray(item.sessionIds) && item.sessionIds.every((id) => typeof id === 'string'))) {
+      throw new DshProtocolError('DSH returned an invalid workspace baseline');
     }
-    return frame.value.archivedSessionIds;
+    return frame.value as unknown as WorkspaceBaseline;
   }
 
   async sessionSnapshot(sessionId: string, maxMessages = 20, signal?: AbortSignal): Promise<SessionFollowSnapshot> {

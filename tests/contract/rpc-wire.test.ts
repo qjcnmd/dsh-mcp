@@ -9,6 +9,20 @@ import { jsonResponse } from '../unit/fixtures.js';
 const config = loadConfig({ DSH_BASE_URL: 'http://127.0.0.1:3080/' });
 
 describe('current DSH RPC wire contract', () => {
+  it('resolves a native workspace before creating its session', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const client = new DshRpcClient(config, async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return jsonResponse({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value: {} } });
+    });
+    await client.workspace.create('C:/project');
+    await client.session.create({ workspaceId: 'project', agentPreset: 'minimal' });
+    expect(bodies).toMatchObject([
+      { method: 'workspace/create', payload: { args: { request: { path: 'C:/project' } } } },
+      { method: 'session/create', payload: { args: { request: { workspaceId: 'project', agentPreset: 'minimal' } } } },
+    ]);
+  });
   it('sets full access through the native permission command', async () => {
     let url = '';
     let body: Record<string, unknown> = {};

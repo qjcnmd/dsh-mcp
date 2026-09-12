@@ -448,19 +448,40 @@ describe('turn lifecycle projection', () => {
     expect(subscriptions).toBe(2);
   });
 
-  it('bounds session identification by the requested wait deadline', async () => {
+  it('bounds session identification by the ten-minute wait deadline', async () => {
     let stopped = false;
     const runtime = testRuntime({ events: { sessionSnapshot: (_id, _limit, signal) => new Promise((_resolve, reject) => {
       signal!.addEventListener('abort', () => { stopped = true; reject(signal!.reason); }, { once: true });
     }) } });
-    const result = await callMcpTool(runtime, 'dsh.session.wait_turn', { sessionId: 'unreachable', timeoutMs: 20 });
-    expect(result).toMatchObject({ isError: true, structuredContent: { error: { code: 'observation-timeout' } } });
-    expect(stopped).toBe(true);
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const spy = vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => timeout(20));
+    try {
+      const result = await callMcpTool(runtime, 'dsh.session.wait_turn', { sessionId: 'unreachable' });
+      expect(spy).toHaveBeenCalledWith(600_000);
+      expect(result).toMatchObject({ isError: true, structuredContent: { error: { code: 'observation-timeout' } } });
+      expect(stopped).toBe(true);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('waits ten minutes without intermediate returns and can resume the same turn', async () => {
+    vi.useFakeTimers();
+    const runtime = testRuntime({ events: { subscribeSession: () => () => undefined } });
+    const record = runtime.turns.register({ sessionId: 'long', sourceRef: 'rpc:long' });
+    try {
+      let finished = false;
+      const waiting = callMcpTool(runtime, 'dsh.session.wait_turn', { turnRef: record.turnRef }).then((result) => { finished = true; return result; });
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(finished).toBe(false);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect((await waiting).structuredContent).toMatchObject({ state: 'timed_out', turnRef: record.turnRef });
+      runtime.turns.transition(record.turnRef, { state: 'completed', reason: null, finalAnswer: 'done' });
+      expect((await callMcpTool(runtime, 'dsh.session.wait_turn', { turnRef: record.turnRef })).content).toContainEqual({ type: 'text', text: 'done' });
+    } finally { vi.useRealTimers(); }
   });
 
   it('takes over an existing completed turn by session identity without a prompt', async () => {
     const runtime = testRuntime({ events: { sessionSnapshot: async () => follow([record(0, 'turn/start', { turn: 8 }), record(1, 'turn/end', { turn: 8, reason: { kind: 'completed' } })]) } });
-    expect((await callMcpTool(runtime, 'dsh.session.wait_turn', { sessionId: 'existing', timeoutMs: 1_000 })).structuredContent).toMatchObject({ state: 'completed', sessionId: 'existing' });
+    expect((await callMcpTool(runtime, 'dsh.session.wait_turn', { sessionId: 'existing' })).structuredContent).toMatchObject({ state: 'completed', sessionId: 'existing' });
   });
 });
 

@@ -15,13 +15,14 @@ const waitOutputSchema = z.discriminatedUnion('state', [
 
 type WaitOutput = z.infer<typeof waitOutputSchema>;
 type WaitResult = ProjectedToolResult<WaitOutput> | ToolErrorResult;
+const WAIT_TIMEOUT_MS = 600_000;
 
 export function registerTurnActions(server: McpServer, runtime: ActionRuntime): void {
   registerAction(server, 'dsh.session.send_message', {
-    description: 'Send a message to the session without queuing and return a turnRef for waiting on the result.',
+    description: 'Send task text and return an acceptance receipt with turnRef, not a completed result. Starts work when idle; steers current work when running. DSH receives this text and its own session history, not the caller conversation. Wait on the returned turnRef for completion.',
     inputSchema: z.object({
       sessionId: id,
-      message: z.string().trim().min(1),
+      message: z.string().trim().min(1).describe('Task or update for DSH. Reference accessible material by shared absolute file paths, adding the current goal, changes relative to that material and necessary constraints. Include relevant details directly when no shared material is available.'),
       requestId: id.describe('Deduplication ID for this message; generated if omitted. Reuse only when retrying the same message.').optional(),
     }).strict(),
     outputSchema: z.object({ sessionId: id, turnRef: id, requestId: id, accepted: z.literal(true) }),
@@ -51,24 +52,23 @@ export function registerTurnActions(server: McpServer, runtime: ActionRuntime): 
   });
 
   registerAction(server, 'dsh.session.wait_turn', {
-    description: 'Wait for a turn to end using either turnRef or sessionId. Returns the complete final reply on success or the end reason otherwise. Returns early when the turn ends; a timeout does not stop DSH.',
+    description: 'Wait with a fixed 10-minute deadline; return immediately on completion, failure or cancellation. Includes the full final reply on completion or the end reason otherwise. Use the turnRef from send_message; sessionId discovers existing work. On timed_out or transport_lost, resume observation with the same turnRef; do not resend the task. Waiting does not call a model or cancel DSH. Client tool timeout must exceed 600 seconds (recommended: 660).',
     inputSchema: z.object({
       turnRef: id.describe('Turn handle returned by send_message or wait_turn.').optional(),
       sessionId: id.describe('Observe the latest started turn in this session unless turn is specified.').optional(),
       turn: z.number().int().nonnegative().describe('Exact DSH turn number to observe. Requires sessionId.').optional(),
-      timeoutMs: z.number().int().positive().max(300_000).default(30_000),
-    }).refine((value) => (value.turnRef === undefined) !== (value.sessionId === undefined), 'exactly one of turnRef or sessionId is required')
+    }).strict().refine((value) => (value.turnRef === undefined) !== (value.sessionId === undefined), 'exactly one of turnRef or sessionId is required')
       .refine((value) => value.turn === undefined || value.sessionId !== undefined, 'turn requires sessionId'),
     outputSchema: waitOutputSchema,
   }, async (args, ctx) => {
     const signal = requestSignal(ctx);
-    if (args.turnRef !== undefined) return waitForTurn(runtime, args.turnRef, args.timeoutMs, signal);
+    if (args.turnRef !== undefined) return waitForTurn(runtime, args.turnRef, WAIT_TIMEOUT_MS, signal);
     const sessionId = args.sessionId!;
-    const deadline = Date.now() + args.timeoutMs;
+    const deadline = Date.now() + WAIT_TIMEOUT_MS;
     let record: TurnRecord | undefined;
     if (args.turn !== undefined) record = runtime.turns.register({ sessionId, sourceRef: 'dsh-turn:' + args.turn });
     else {
-      const timeout = AbortSignal.timeout(args.timeoutMs);
+      const timeout = AbortSignal.timeout(WAIT_TIMEOUT_MS);
       try {
         await runtime.observations.inspect(sessionId, AbortSignal.any([signal, timeout]));
       } catch (error) {
@@ -83,7 +83,7 @@ export function registerTurnActions(server: McpServer, runtime: ActionRuntime): 
   });
 
   registerAction(server, 'dsh.session.cancel', {
-    description: 'Request cancellation of active DSH work. Use wait_turn to observe its final state.',
+    description: 'Request cancellation of active DSH work. The receipt acknowledges the request, not completed cancellation. Use wait_turn to observe the final state before starting replacement work.',
     inputSchema: z.object({ sessionId: id }),
     outputSchema: z.object({ sessionId: id, cancellationRequested: z.literal(true) }),
   }, async (args, ctx) => {
@@ -150,7 +150,9 @@ function waitResult(record: TurnRecord): ProjectedToolResult<WaitOutput> {
   } else {
     metadata = { state: 'timed_out', turnRef: record.turnRef, sessionId: record.sessionId, observedState: state };
   }
-  const summary = 'DSH turn ' + String(metadata.state).replaceAll('_', ' ') + '.';
+  const summary = metadata.state === 'timed_out'
+    ? 'The 10-minute wait ended; DSH work remains ' + metadata.observedState + '. Continue waiting with the returned turnRef.'
+    : 'DSH turn ' + String(metadata.state).replaceAll('_', ' ') + '.';
   const result = projectToolResult(metadata, summary);
   if (record.state === 'completed' && record.finalAnswer !== null) result.content.push({ type: 'text', text: record.finalAnswer });
   return result;

@@ -1,6 +1,6 @@
 {
-  "name": "@qjcnmd/dsh-mcp",
-  "version": "0.1.0",
+  "name": "@qjcnb/dsh-mcp",
+  "version": "0.2.0",
   "description": "Use DSH minimal, full-access sessions from any MCP client in the same project",
   "license": "MIT",
   "bin": {
@@ -17,6 +17,7 @@
   "bugs": "https://github.com/qjcnmd/dsh-mcp/issues",
   "files": [
     "dist",
+    "plugins/dsh-mcp",
     "README.md"
   ],
   "keywords": [
@@ -29,6 +30,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "prepare": "npm run build",
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "prepack": "npm run build",

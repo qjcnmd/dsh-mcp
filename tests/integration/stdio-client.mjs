@@ -31,7 +31,8 @@ export class StdioClient {
   request(method, params) {
     const id = this.nextId++;
     return new Promise((resolveRequest, rejectRequest) => {
-      const timer = setTimeout(() => { this.pending.delete(id); rejectRequest(new Error('MCP request timed out: ' + method)); }, 60_000);
+      const timeoutMs = method === 'tools/call' && params.name === 'dsh.session.wait_turn' ? 660_000 : 60_000;
+      const timer = setTimeout(() => { this.pending.delete(id); rejectRequest(new Error('MCP request timed out: ' + method)); }, timeoutMs);
       this.pending.set(id, { resolve: (value) => { clearTimeout(timer); resolveRequest(value); }, reject: (error) => { clearTimeout(timer); rejectRequest(error); } });
       this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
